@@ -5,6 +5,7 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -23,10 +24,8 @@ func TestBer2Der(t *testing.T) {
 
 	if der2, err := ber2der(der); err != nil {
 		t.Errorf("ber2der on DER bytes failed with error: %v", err)
-	} else {
-		if !bytes.Equal(der, der2) {
-			t.Error("ber2der is not idempotent")
-		}
+	} else if !bytes.Equal(der, der2) {
+		t.Error("ber2der is not idempotent")
 	}
 	var thing struct {
 		Number int
@@ -46,8 +45,8 @@ func TestBer2Der_Negatives(t *testing.T) {
 	}{
 		{[]byte{0x30, 0x85}, "tag length too long"},
 		{[]byte{0x30, 0x84, 0x80, 0x0, 0x0, 0x0}, "length is negative"},
-		{[]byte{0x30, 0x82, 0x0, 0x1}, "length has leading zero"},
-		{[]byte{0x30, 0x80, 0x1, 0x2, 0x1, 0x2}, "Invalid BER format"},
+		{[]byte{0x30, 0x82, 0x0, 0x1}, "more than available data"},
+		{[]byte{0x30, 0x80, 0x1, 0x2, 0x1, 0x2}, "end of ber data reached"},
 		{[]byte{0x30, 0x80, 0x1, 0x2}, "BER tag length is more than available data"},
 		{[]byte{0x30, 0x03, 0x01, 0x02}, "length is more than available data"},
 		{[]byte{0x30}, "end of ber data reached"},
@@ -116,16 +115,14 @@ func TestBer2Der_NestedMultipleIndefinite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ber2der failed with error: %v", err)
 	}
-	if bytes.Compare(der, expected) != 0 {
+	if !bytes.Equal(der, expected) {
 		t.Errorf("ber2der result did not match.\n\tExpected: % X\n\tActual: % X", expected, der)
 	}
 
 	if der2, err := ber2der(der); err != nil {
 		t.Errorf("ber2der on DER bytes failed with error: %v", err)
-	} else {
-		if !bytes.Equal(der, der2) {
-			t.Error("ber2der is not idempotent")
-		}
+	} else if !bytes.Equal(der, der2) {
+		t.Error("ber2der is not idempotent")
 	}
 	var thing struct {
 		Nest1 struct {
@@ -140,6 +137,84 @@ func TestBer2Der_NestedMultipleIndefinite(t *testing.T) {
 		t.Errorf("Cannot parse resulting DER because: %v", err)
 	} else if len(rest) > 0 {
 		t.Errorf("Resulting DER has trailing data: % X", rest)
+	}
+}
+
+// TestBer2DerStructure covers the structural BER rules: empty indefinite elements, non-minimal
+// lengths, children that overrun their parent, stray end-of-contents octets and trailing data.
+func TestBer2DerStructure(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		in      []byte
+		want    []byte
+		wantErr string
+	}{
+		{name: "empty indefinite sequence", in: []byte{0x30, 0x80, 0x00, 0x00}, want: []byte{0x30, 0x00}},
+		{name: "nested empty indefinite set", in: []byte{0x30, 0x80, 0x31, 0x80, 0x00, 0x00, 0x00, 0x00}, want: []byte{0x30, 0x02, 0x31, 0x00}},
+		{name: "non-minimal long length", in: []byte{0x30, 0x82, 0x00, 0x03, 0x02, 0x01, 0x05}, want: []byte{0x30, 0x03, 0x02, 0x01, 0x05}},
+		{name: "long form for a short length", in: []byte{0x04, 0x81, 0x01, 0x41}, want: []byte{0x04, 0x01, 0x41}},
+		{name: "child overruns its parent", in: []byte{0x30, 0x02, 0x04, 0x03, 0x01, 0x02, 0x03}, wantErr: "more than available data"},
+		{name: "end-of-contents in a definite element", in: []byte{0x30, 0x02, 0x00, 0x00}, wantErr: "end-of-contents"},
+		{name: "end-of-contents at the top level", in: []byte{0x00, 0x00}, wantErr: "end-of-contents"},
+		{name: "universal tag 0 with a long-form zero length", in: []byte{0x00, 0x81, 0x00}, wantErr: "reserved universal tag 0"},
+		{name: "constructed universal tag 0", in: []byte{0x30, 0x02, 0x20, 0x00}, wantErr: "reserved universal tag 0"},
+		{name: "trailing data after the element", in: []byte{0x30, 0x00, 0x05}, wantErr: "trailing data"},
+		{name: "unterminated indefinite element", in: []byte{0x30, 0x80, 0x02, 0x01, 0x01}, wantErr: "end of ber data reached"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ber2der(tt.in)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("ber2der(% X) = % X, %v, want error containing %q", tt.in, got, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ber2der(% X): %v", tt.in, err)
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("ber2der(% X) = % X, want % X", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBer2DerDepthLimit checks that deeply nested input is refused instead of recursing without bound.
+func TestBer2DerDepthLimit(t *testing.T) {
+	t.Parallel()
+	nest := func(depth int) []byte {
+		in := bytes.Repeat([]byte{0x30, 0x80}, depth)
+		return append(in, bytes.Repeat([]byte{0x00, 0x00}, depth)...)
+	}
+	if _, err := ber2der(nest(maxBERDepth)); err != nil {
+		t.Fatalf("nesting at the limit: %v", err)
+	}
+	if _, err := ber2der(nest(maxBERDepth + 1)); err == nil || !strings.Contains(err.Error(), "nested too deeply") {
+		t.Fatalf("nesting beyond the limit: got %v, want a depth error", err)
+	}
+}
+
+// TestParseRejectsTrailingData checks that bytes after the outer ContentInfo are an error.
+func TestParseRejectsTrailingData(t *testing.T) {
+	t.Parallel()
+	der := mustDecodePEM([]byte(testPKCS7))
+	if _, err := Parse(der); err != nil {
+		t.Fatalf("Parse of the fixture: %v", err)
+	}
+	if _, err := Parse(append(der, 0x05, 0x00)); err == nil {
+		t.Fatal("Parse accepted trailing data after the ContentInfo")
+	}
+}
+
+// BenchmarkBer2DerWideIndefinite measures a wide indefinite-length element, which once took time
+// quadratic in its size because every child searched the rest of the input for the terminator.
+func BenchmarkBer2DerWideIndefinite(b *testing.B) {
+	in := slices.Concat([]byte{0x30, 0x80}, bytes.Repeat([]byte{0x02, 0x01, 0x01}, 20000), []byte{0x00, 0x00})
+	for b.Loop() {
+		if _, err := ber2der(in); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
