@@ -18,7 +18,7 @@ import (
 
 	_ "crypto/sha1" // for crypto.SHA1
 
-	legacyx509 "github.com/smallstep/pkcs7/internal/legacy/x509"
+	legacyx509 "github.com/misiektoja/go-pkcs7/internal/legacy/x509"
 )
 
 // PKCS7 Represents a PKCS7 structure

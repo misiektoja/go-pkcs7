@@ -24,8 +24,8 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"github.com/smallstep/pkcs7/internal/cryptobyte"
-	cryptobyte_asn1 "github.com/smallstep/pkcs7/internal/cryptobyte/asn1"
+	"github.com/misiektoja/go-pkcs7/internal/cryptobyte"
+	cryptobyte_asn1 "github.com/misiektoja/go-pkcs7/internal/cryptobyte/asn1"
 
 	stdx509 "crypto/x509"
 )

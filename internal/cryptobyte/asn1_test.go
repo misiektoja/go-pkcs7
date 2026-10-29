@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smallstep/pkcs7/internal/cryptobyte/asn1"
+	"github.com/misiektoja/go-pkcs7/internal/cryptobyte/asn1"
 )
 
 type readASN1Test struct {
