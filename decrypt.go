@@ -86,7 +86,8 @@ type Recipient struct {
 }
 
 // Recipients lists the recipients of an EnvelopedData message, so a receiver that holds several
-// keys can choose the one that decrypts it.
+// keys can choose the one that decrypts it. They come in encoded order. DER sorts the recipient
+// set, so the order need not match the certificates given to Encrypt.
 func (p7 *PKCS7) Recipients() ([]Recipient, error) {
 	data, ok := p7.raw.(envelopedData)
 	if !ok {
