@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -254,9 +255,13 @@ func TestRecipients(t *testing.T) {
 	if len(recipients) != len(certs) {
 		t.Fatalf("Recipients() returned %d recipients, want %d", len(recipients), len(certs))
 	}
+	// RecipientInfos is a DER SET OF, so the encoded order follows the bytes, not the Encrypt order.
 	for i, cert := range certs {
-		if !bytes.Equal(recipients[i].Issuer, cert.RawIssuer) || recipients[i].SerialNumber.Cmp(cert.SerialNumber) != 0 {
-			t.Errorf("recipient %d does not identify certificate %d", i, i)
+		found := slices.ContainsFunc(recipients, func(r Recipient) bool {
+			return bytes.Equal(r.Issuer, cert.RawIssuer) && r.SerialNumber.Cmp(cert.SerialNumber) == 0
+		})
+		if !found {
+			t.Errorf("no recipient identifies certificate %d", i)
 		}
 	}
 
