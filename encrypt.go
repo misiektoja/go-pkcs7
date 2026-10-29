@@ -13,6 +13,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 type envelopedData struct {
@@ -39,47 +40,116 @@ type encryptedContentInfo struct {
 	EncryptedContent           asn1.RawValue `asn1:"tag:0,optional"`
 }
 
+// ContentEncryptionAlgorithm identifies the symmetric cipher that encrypts EnvelopedData and
+// EncryptedData content. The zero value selects AES128CBC.
+type ContentEncryptionAlgorithm int
+
 const (
-	// EncryptionAlgorithmDESCBC is the DES CBC encryption algorithm
-	EncryptionAlgorithmDESCBC = iota
-
-	// EncryptionAlgorithmAES128CBC is the AES 128 bits with CBC encryption algorithm
-	// Avoid this algorithm unless required for interoperability; use AES GCM instead.
-	EncryptionAlgorithmAES128CBC
-
-	// EncryptionAlgorithmAES256CBC is the AES 256 bits with CBC encryption algorithm
-	// Avoid this algorithm unless required for interoperability; use AES GCM instead.
-	EncryptionAlgorithmAES256CBC
-
-	// EncryptionAlgorithmAES128GCM is the AES 128 bits with GCM encryption algorithm
-	EncryptionAlgorithmAES128GCM
-
-	// EncryptionAlgorithmAES256GCM is the AES 256 bits with GCM encryption algorithm
-	EncryptionAlgorithmAES256GCM
+	// AES128CBC is AES with a 128-bit key in CBC mode. SCEP (RFC 8894) requires it.
+	AES128CBC ContentEncryptionAlgorithm = iota + 1
+	// AES192CBC is AES with a 192-bit key in CBC mode.
+	AES192CBC
+	// AES256CBC is AES with a 256-bit key in CBC mode.
+	AES256CBC
+	// DESEDE3CBC is three-key triple DES in CBC mode, for clients that predate AES.
+	DESEDE3CBC
+	// DESCBC is single DES in CBC mode. Its 56-bit key is broken. Decryption refuses it unless
+	// DecryptOptions lists it.
+	DESCBC
 )
 
-// ContentEncryptionAlgorithm determines the algorithm used to encrypt the
-// plaintext message. Change the value of this variable to change which
-// algorithm is used in the Encrypt() function.
-var ContentEncryptionAlgorithm = EncryptionAlgorithmDESCBC
+// contentCipher describes one content encryption algorithm.
+type contentCipher struct {
+	name     string
+	oid      asn1.ObjectIdentifier
+	keyLen   int
+	newBlock func(key []byte) (cipher.Block, error)
+}
+
+// contentCiphers holds every content encryption algorithm this package implements.
+var contentCiphers = map[ContentEncryptionAlgorithm]contentCipher{
+	AES128CBC:  {"AES-128-CBC", OIDEncryptionAlgorithmAES128CBC, 16, aes.NewCipher},
+	AES192CBC:  {"AES-192-CBC", OIDEncryptionAlgorithmAES192CBC, 24, aes.NewCipher},
+	AES256CBC:  {"AES-256-CBC", OIDEncryptionAlgorithmAES256CBC, 32, aes.NewCipher},
+	DESEDE3CBC: {"DES-EDE3-CBC", OIDEncryptionAlgorithmDESEDE3CBC, 24, des.NewTripleDESCipher},
+	DESCBC:     {"DES-CBC", OIDEncryptionAlgorithmDESCBC, 8, des.NewCipher},
+}
+
+// String returns the OpenSSL-style name of the algorithm.
+func (a ContentEncryptionAlgorithm) String() string {
+	if c, ok := contentCiphers[a]; ok {
+		return c.name
+	}
+	return fmt.Sprintf("ContentEncryptionAlgorithm(%d)", int(a))
+}
+
+// contentEncryptionAlgorithmForOID returns the algorithm an identifier names.
+func contentEncryptionAlgorithmForOID(oid asn1.ObjectIdentifier) (ContentEncryptionAlgorithm, bool) {
+	for alg, c := range contentCiphers {
+		if c.oid.Equal(oid) {
+			return alg, true
+		}
+	}
+	return 0, false
+}
+
+// KeyEncryptionAlgorithm identifies how the content key is encrypted for an RSA recipient. The zero
+// value selects RSAPKCS1v15.
+type KeyEncryptionAlgorithm int
+
+const (
+	// RSAPKCS1v15 is RSAES-PKCS1-v1_5 key transport. SCEP clients expect it.
+	RSAPKCS1v15 KeyEncryptionAlgorithm = iota + 1
+	// RSAOAEP is RSAES-OAEP key transport (RFC 8017) with MGF1 over EncryptOptions.OAEPHash.
+	RSAOAEP
+)
+
+// String returns the name of the algorithm.
+func (a KeyEncryptionAlgorithm) String() string {
+	switch a {
+	case RSAPKCS1v15:
+		return "RSAES-PKCS1-v1_5"
+	case RSAOAEP:
+		return "RSAES-OAEP"
+	}
+	return fmt.Sprintf("KeyEncryptionAlgorithm(%d)", int(a))
+}
+
+// EncryptOptions selects the algorithms Encrypt and EncryptUsingPSK use.
+type EncryptOptions struct {
+	// ContentEncryption is the content cipher. The zero value selects AES128CBC.
+	ContentEncryption ContentEncryptionAlgorithm
+
+	// KeyEncryption is the RSA key transport for each recipient. The zero value selects RSAPKCS1v15.
+	// EncryptUsingPSK ignores it.
+	KeyEncryption KeyEncryptionAlgorithm
+
+	// OAEPHash is the RSAES-OAEP hash and MGF1 hash. The zero value selects SHA-256.
+	OAEPHash crypto.Hash
+}
+
+// contentCipher returns the content cipher the options select.
+func (opts EncryptOptions) contentCipher() (contentCipher, error) {
+	alg := opts.ContentEncryption
+	if alg == 0 {
+		alg = AES128CBC
+	}
+	c, ok := contentCiphers[alg]
+	if !ok {
+		return contentCipher{}, ErrUnsupportedEncryptionAlgorithm
+	}
+	return c, nil
+}
 
 // ErrUnsupportedEncryptionAlgorithm is returned when attempting to encrypt
 // content with an unsupported algorithm.
-var ErrUnsupportedEncryptionAlgorithm = errors.New("pkcs7: cannot encrypt content: only DES-CBC, AES-CBC, and AES-GCM supported")
-
-// KeyEncryptionAlgorithm determines the algorithm used to encrypt a
-// content key. Change the value of this variable to change which
-// algorithm is used in the Encrypt() function.
-var KeyEncryptionAlgorithm = OIDEncryptionAlgorithmRSA
+var ErrUnsupportedEncryptionAlgorithm = errors.New(
+	"pkcs7: cannot encrypt content: only AES-CBC, DES-EDE3-CBC and DES-CBC are supported",
+)
 
 // ErrUnsupportedKeyEncryptionAlgorithm is returned when an
-// unsupported key encryption algorithm OID is provided.
+// unsupported key encryption algorithm is requested.
 var ErrUnsupportedKeyEncryptionAlgorithm = errors.New("pkcs7: unsupported key encryption algorithm provided")
-
-// KeyEncryptionHash determines the crypto.Hash algorithm to use
-// when encrypting a content key. Change the value of this variable
-// to change which algorithm is used in the Encrypt() function.
-var KeyEncryptionHash = crypto.SHA256
 
 // ErrUnsupportedKeyEncryptionHash is returned when an
 // unsupported key encryption hash is provided.
@@ -89,262 +159,69 @@ var ErrUnsupportedKeyEncryptionHash = errors.New("pkcs7: unsupported key encrypt
 // using a PSK without actually providing the PSK.
 var ErrPSKNotProvided = errors.New("pkcs7: cannot encrypt content: PSK not provided")
 
-const nonceSize = 12
-
-type aesGCMParameters struct {
-	Nonce  []byte `asn1:"tag:4"`
-	ICVLen int
-}
-
-func encryptAESGCM(content []byte, key []byte) ([]byte, *encryptedContentInfo, error) {
-	var keyLen int
-	var algID asn1.ObjectIdentifier
-	switch ContentEncryptionAlgorithm {
-	case EncryptionAlgorithmAES128GCM:
-		keyLen = 16
-		algID = OIDEncryptionAlgorithmAES128GCM
-	case EncryptionAlgorithmAES256GCM:
-		keyLen = 32
-		algID = OIDEncryptionAlgorithmAES256GCM
-	default:
-		return nil, nil, fmt.Errorf("invalid ContentEncryptionAlgorithm in encryptAESGCM: %d", ContentEncryptionAlgorithm)
-	}
-	if key == nil {
-		// Create AES key
-		key = make([]byte, keyLen)
-
-		_, err := rand.Read(key)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	// Create nonce
-	nonce := make([]byte, nonceSize)
-
-	_, err := rand.Read(nonce)
+// encryptCBC pads and encrypts content in CBC mode under key with a random IV.
+func encryptCBC(c contentCipher, content, key []byte) (*encryptedContentInfo, error) {
+	block, err := c.newBlock(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-
-	// Encrypt content
-	block, err := aes.NewCipher(key)
+	iv := make([]byte, block.BlockSize())
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+	plaintext, err := pad(content, block.BlockSize())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ciphertext := gcm.Seal(nil, nonce, content, nil)
-
-	// Prepare ASN.1 Encrypted Content Info
-	paramSeq := aesGCMParameters{
-		Nonce:  nonce,
-		ICVLen: gcm.Overhead(),
-	}
-
-	paramBytes, err := asn1.Marshal(paramSeq)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	eci := encryptedContentInfo{
+	ciphertext := make([]byte, len(plaintext))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, plaintext)
+	return &encryptedContentInfo{
 		ContentType: OIDData,
 		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
-			Algorithm: algID,
-			Parameters: asn1.RawValue{
-				Tag:   asn1.TagSequence,
-				Bytes: paramBytes,
-			},
+			Algorithm:  c.oid,
+			Parameters: asn1.RawValue{Tag: asn1.TagOctetString, Bytes: iv},
 		},
 		EncryptedContent: marshalEncryptedContent(ciphertext),
-	}
-
-	return key, &eci, nil
+	}, nil
 }
 
-func encryptDESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, error) {
-	if key == nil {
-		// Create DES key
-		key = make([]byte, 8)
-
-		_, err := rand.Read(key)
-		if err != nil {
-			return nil, nil, err
-		}
+// Encrypt creates an EnvelopedData message whose content key is encrypted for each recipient
+// certificate. Recipients must hold RSA keys.
+func Encrypt(content []byte, recipients []*x509.Certificate, opts EncryptOptions) ([]byte, error) {
+	if len(recipients) == 0 {
+		return nil, errors.New("pkcs7: no recipients")
 	}
-
-	// Create CBC IV
-	iv := make([]byte, des.BlockSize)
-	_, err := rand.Read(iv)
+	c, err := opts.contentCipher()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-
-	// Encrypt padded content
-	block, err := des.NewCipher(key)
+	kea, err := opts.keyEncryptionAlgorithm()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	mode := cipher.NewCBCEncrypter(block, iv)
-	plaintext, err := pad(content, mode.BlockSize())
-	if err != nil {
-		return nil, nil, err
+	key := make([]byte, c.keyLen)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
 	}
-	cyphertext := make([]byte, len(plaintext))
-	mode.CryptBlocks(cyphertext, plaintext)
-
-	// Prepare ASN.1 Encrypted Content Info
-	eci := encryptedContentInfo{
-		ContentType: OIDData,
-		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
-			Algorithm:  OIDEncryptionAlgorithmDESCBC,
-			Parameters: asn1.RawValue{Tag: 4, Bytes: iv},
-		},
-		EncryptedContent: marshalEncryptedContent(cyphertext),
-	}
-
-	return key, &eci, nil
-}
-
-func encryptAESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, error) {
-	var keyLen int
-	var algID asn1.ObjectIdentifier
-	switch ContentEncryptionAlgorithm {
-	case EncryptionAlgorithmAES128CBC:
-		keyLen = 16
-		algID = OIDEncryptionAlgorithmAES128CBC
-	case EncryptionAlgorithmAES256CBC:
-		keyLen = 32
-		algID = OIDEncryptionAlgorithmAES256CBC
-	default:
-		return nil, nil, fmt.Errorf("invalid ContentEncryptionAlgorithm in encryptAESCBC: %d", ContentEncryptionAlgorithm)
-	}
-
-	if key == nil {
-		// Create AES key
-		key = make([]byte, keyLen)
-
-		_, err := rand.Read(key)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	// Create CBC IV
-	iv := make([]byte, aes.BlockSize)
-	_, err := rand.Read(iv)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Encrypt padded content
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, err
-	}
-	mode := cipher.NewCBCEncrypter(block, iv)
-	plaintext, err := pad(content, mode.BlockSize())
-	if err != nil {
-		return nil, nil, err
-	}
-	cyphertext := make([]byte, len(plaintext))
-	mode.CryptBlocks(cyphertext, plaintext)
-
-	// Prepare ASN.1 Encrypted Content Info
-	eci := encryptedContentInfo{
-		ContentType: OIDData,
-		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
-			Algorithm:  algID,
-			Parameters: asn1.RawValue{Tag: 4, Bytes: iv},
-		},
-		EncryptedContent: marshalEncryptedContent(cyphertext),
-	}
-
-	return key, &eci, nil
-}
-
-// Encrypt creates and returns an envelope data PKCS7 structure with encrypted
-// recipient keys for each recipient public key.
-//
-// The algorithm used to perform encryption is determined by the current value
-// of the global ContentEncryptionAlgorithm package variable. By default, the
-// value is EncryptionAlgorithmDESCBC. To use a different algorithm, change the
-// value before calling Encrypt(). For example:
-//
-//	ContentEncryptionAlgorithm = EncryptionAlgorithmAES256GCM
-//
-// TODO(fullsailor): Add support for encrypting content with other algorithms
-func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
-	var eci *encryptedContentInfo
-	var key []byte
-	var err error
-
-	// Apply chosen symmetric encryption method
-	switch ContentEncryptionAlgorithm {
-	case EncryptionAlgorithmDESCBC:
-		key, eci, err = encryptDESCBC(content, nil)
-	case EncryptionAlgorithmAES128CBC:
-		fallthrough
-	case EncryptionAlgorithmAES256CBC:
-		key, eci, err = encryptAESCBC(content, nil)
-	case EncryptionAlgorithmAES128GCM:
-		fallthrough
-	case EncryptionAlgorithmAES256GCM:
-		key, eci, err = encryptAESGCM(content, nil)
-
-	default:
-		return nil, ErrUnsupportedEncryptionAlgorithm
-	}
-
+	eci, err := encryptCBC(c, content, key)
 	if err != nil {
 		return nil, err
 	}
 
-	// Prepare each recipient's encrypted cipher key
 	recipientInfos := make([]recipientInfo, len(recipients))
 	for i, recipient := range recipients {
-		algorithm := KeyEncryptionAlgorithm
-		hash := KeyEncryptionHash
-		var kea pkix.AlgorithmIdentifier
-		switch {
-		case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
-			parameters, err := getParametersForKeyEncryptionAlgorithm(algorithm, hash)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get parameters for key encryption: %v", err)
-			}
-			kea = pkix.AlgorithmIdentifier{
-				Algorithm:  algorithm,
-				Parameters: parameters,
-			}
-		case algorithm.Equal(OIDEncryptionAlgorithmRSA):
-			kea = pkix.AlgorithmIdentifier{
-				Algorithm: algorithm,
-			}
-		default:
-			return nil, ErrUnsupportedKeyEncryptionAlgorithm
-		}
-		encrypted, err := encryptKey(key, recipient, algorithm, hash)
+		encrypted, err := encryptKey(key, recipient, opts)
 		if err != nil {
 			return nil, err
 		}
-		ias, err := cert2issuerAndSerial(recipient)
-		if err != nil {
-			return nil, err
-		}
-		info := recipientInfo{
+		recipientInfos[i] = recipientInfo{
 			Version:                0,
-			IssuerAndSerialNumber:  ias,
+			IssuerAndSerialNumber:  cert2issuerAndSerial(recipient),
 			KeyEncryptionAlgorithm: kea,
 			EncryptedKey:           encrypted,
 		}
-		recipientInfos[i] = info
 	}
 
-	// Prepare envelope content
 	envelope := envelopedData{
 		EncryptedContentInfo: *eci,
 		Version:              0,
@@ -354,76 +231,91 @@ func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Prepare outer payload structure
 	wrapper := contentInfo{
 		ContentType: OIDEnvelopedData,
 		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: innerContent},
 	}
-
 	return asn1.Marshal(wrapper)
 }
 
-func getParametersForKeyEncryptionAlgorithm(algorithm asn1.ObjectIdentifier, hash crypto.Hash) (asn1.RawValue, error) {
-	if !algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP) {
-		return asn1.RawValue{}, nil // return empty; not used
-	}
-
-	params := rsaOAEPAlgorithmParameters{}
-	switch hash {
-	case crypto.SHA1:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA1}
-	case crypto.SHA224:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA224}
-	case crypto.SHA256:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA256}
-	case crypto.SHA384:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA384}
-	case crypto.SHA512:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA512}
-	default:
-		return asn1.RawValue{}, ErrUnsupportedAlgorithm
-	}
-
-	b, err := asn1.Marshal(params)
-	if err != nil {
-		return asn1.RawValue{}, fmt.Errorf("failed marshaling key encryption parameters: %v", err)
-	}
-
-	return asn1.RawValue{
-		FullBytes: b,
-	}, nil
+// rsaOAEPParameters is RSAES-OAEP-params from RFC 8017 appendix A.2.1.
+type rsaOAEPParameters struct {
+	Hash    pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:0"`
+	MGF     pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:1"`
+	PSource pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:2"`
 }
 
-// EncryptUsingPSK creates and returns an encrypted data PKCS7 structure,
-// encrypted using caller provided pre-shared secret.
-func EncryptUsingPSK(content []byte, key []byte) ([]byte, error) {
-	var eci *encryptedContentInfo
-	var err error
+// oaepHash returns the RSAES-OAEP hash the options select.
+func (opts EncryptOptions) oaepHash() (crypto.Hash, error) {
+	hash := opts.OAEPHash
+	if hash == 0 {
+		hash = crypto.SHA256
+	}
+	switch hash {
+	case crypto.SHA1, crypto.SHA224, crypto.SHA256, crypto.SHA384, crypto.SHA512:
+		return hash, nil
+	default:
+		return 0, ErrUnsupportedKeyEncryptionHash
+	}
+}
 
+// keyEncryptionAlgorithm returns the recipientInfo key encryption algorithm identifier.
+func (opts EncryptOptions) keyEncryptionAlgorithm() (pkix.AlgorithmIdentifier, error) {
+	switch opts.KeyEncryption {
+	case 0, RSAPKCS1v15:
+		return pkix.AlgorithmIdentifier{Algorithm: OIDEncryptionAlgorithmRSA, Parameters: asn1.NullRawValue}, nil
+	case RSAOAEP:
+		hash, err := opts.oaepHash()
+		if err != nil {
+			return pkix.AlgorithmIdentifier{}, err
+		}
+		hashOID, err := getDigestOIDForHash(hash)
+		if err != nil {
+			return pkix.AlgorithmIdentifier{}, err
+		}
+		// The MGF1 hash is written out because its default is SHA-1, while crypto/rsa uses the
+		// OAEP hash for MGF1 too.
+		mgfParams, err := asn1.Marshal(pkix.AlgorithmIdentifier{Algorithm: hashOID})
+		if err != nil {
+			return pkix.AlgorithmIdentifier{}, err
+		}
+		params := rsaOAEPParameters{
+			Hash: pkix.AlgorithmIdentifier{Algorithm: hashOID},
+			MGF: pkix.AlgorithmIdentifier{
+				Algorithm:  OIDMaskGenerationFunctionMGF1,
+				Parameters: asn1.RawValue{FullBytes: mgfParams},
+			},
+		}
+		encoded, err := asn1.Marshal(params)
+		if err != nil {
+			return pkix.AlgorithmIdentifier{}, err
+		}
+		return pkix.AlgorithmIdentifier{
+			Algorithm:  OIDEncryptionAlgorithmRSAESOAEP,
+			Parameters: asn1.RawValue{FullBytes: encoded},
+		}, nil
+	}
+	return pkix.AlgorithmIdentifier{}, ErrUnsupportedKeyEncryptionAlgorithm
+}
+
+// EncryptUsingPSK creates an EncryptedData message whose content is encrypted with the pre-shared
+// key. The key length must match the content cipher.
+func EncryptUsingPSK(content []byte, key []byte, opts EncryptOptions) ([]byte, error) {
 	if key == nil {
 		return nil, ErrPSKNotProvided
 	}
-
-	// Apply chosen symmetric encryption method
-	switch ContentEncryptionAlgorithm {
-	case EncryptionAlgorithmDESCBC:
-		_, eci, err = encryptDESCBC(content, key)
-
-	case EncryptionAlgorithmAES128GCM:
-		fallthrough
-	case EncryptionAlgorithmAES256GCM:
-		_, eci, err = encryptAESGCM(content, key)
-
-	default:
-		return nil, ErrUnsupportedEncryptionAlgorithm
+	c, err := opts.contentCipher()
+	if err != nil {
+		return nil, err
 	}
-
+	if len(key) != c.keyLen {
+		return nil, fmt.Errorf("pkcs7: %s needs a %d-byte key, got %d bytes", c.name, c.keyLen, len(key))
+	}
+	eci, err := encryptCBC(c, content, key)
 	if err != nil {
 		return nil, err
 	}
 
-	// Prepare encrypted-data content
 	ed := encryptedData{
 		Version:              0,
 		EncryptedContentInfo: *eci,
@@ -432,44 +324,44 @@ func EncryptUsingPSK(content []byte, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Prepare outer payload structure
 	wrapper := contentInfo{
 		ContentType: OIDEncryptedData,
 		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: innerContent},
 	}
-
 	return asn1.Marshal(wrapper)
 }
 
+// marshalEncryptedContent wraps ciphertext in the implicit [0] encryptedContent field.
 func marshalEncryptedContent(content []byte) asn1.RawValue {
 	return asn1.RawValue{Bytes: content, Class: 2, IsCompound: false}
 }
 
-func encryptKey(key []byte, recipient *x509.Certificate, algorithm asn1.ObjectIdentifier, hash crypto.Hash) ([]byte, error) {
+// encryptKey encrypts the content key for one RSA recipient.
+func encryptKey(key []byte, recipient *x509.Certificate, opts EncryptOptions) ([]byte, error) {
 	pub, ok := recipient.PublicKey.(*rsa.PublicKey)
 	if !ok {
 		return nil, ErrUnsupportedKeyType
 	}
-
-	switch {
-	case algorithm.Equal(OIDEncryptionAlgorithmRSA):
-		return rsa.EncryptPKCS1v15(rand.Reader, pub, key)
-	case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
+	switch opts.KeyEncryption {
+	case 0, RSAPKCS1v15:
+		// SCEP and older CMS peers need PKCS #1 v1.5 key transport, which Go has deprecated.
+		return rsa.EncryptPKCS1v15(rand.Reader, pub, key) //nolint:staticcheck // See above.
+	case RSAOAEP:
+		hash, err := opts.oaepHash()
+		if err != nil {
+			return nil, err
+		}
 		return rsa.EncryptOAEP(hash.New(), rand.Reader, pub, key, nil)
-	default:
-		return nil, ErrUnsupportedKeyEncryptionAlgorithm
 	}
+	return nil, ErrUnsupportedKeyEncryptionAlgorithm
 }
 
+// pad appends PKCS #7 padding (RFC 5652 section 6.3) up to a multiple of blocklen.
 func pad(data []byte, blocklen int) ([]byte, error) {
-	if blocklen < 1 {
+	if blocklen < 1 || blocklen > 255 {
 		return nil, fmt.Errorf("invalid blocklen %d", blocklen)
 	}
 	padlen := blocklen - (len(data) % blocklen)
-	if padlen == 0 {
-		padlen = blocklen
-	}
-	pad := bytes.Repeat([]byte{byte(padlen)}, padlen)
-	return append(data, pad...), nil
+	padding := bytes.Repeat([]byte{byte(padlen)}, padlen) //nolint:gosec // padlen is at most blocklen, which is below 256.
+	return append(slices.Clip(data), padding...), nil
 }
