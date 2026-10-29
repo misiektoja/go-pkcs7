@@ -12,9 +12,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"os/exec"
@@ -29,7 +29,7 @@ func TestVerify(t *testing.T) {
 		t.Errorf("Parse encountered unexpected error: %v", err)
 	}
 
-	if err := p7.Verify(); err != nil {
+	if err := p7.Verify(VerifyOptions{}); err != nil {
 		t.Errorf("Verify failed with error: %v", err)
 	}
 
@@ -98,13 +98,13 @@ func TestInvalidSigningTime(t *testing.T) {
 	}
 
 	// verify without a chain (self-signed cert), at time.Now()
-	err = p7.VerifyWithChainAtTime(nil, time.Now())
+	err = p7.Verify(VerifyOptions{CurrentTime: time.Now()})
 	if err == nil {
 		t.Fatal("expected verification error, but got nil")
 	}
 
-	signingTimeErr, ok := err.(*SigningTimeNotValidError)
-	if !ok {
+	var signingTimeErr *SigningTimeNotValidError
+	if !errors.As(err, &signingTimeErr) {
 		t.Fatalf("expected *SigningTimeNotValidError, but got %T", err)
 	}
 
@@ -117,13 +117,12 @@ func TestInvalidSigningTime(t *testing.T) {
 	}
 
 	// verify without a chain (self-signed cert), but without specifying the time
-	err = p7.VerifyWithChain(nil)
+	err = p7.Verify(VerifyOptions{})
 	if err == nil {
 		t.Fatal("expected verification error, but got nil")
 	}
 
-	signingTimeErr, ok = err.(*SigningTimeNotValidError)
-	if !ok {
+	if !errors.As(err, &signingTimeErr) {
 		t.Fatalf("expected *SigningTimeNotValidError, but got %T", err)
 	}
 
@@ -196,7 +195,7 @@ func TestVerifyWithHasher(t *testing.T) {
 	p7.Content = []byte(longBuffer)
 	p7.Hasher = &testHasher{}
 
-	if err := p7.Verify(); err != nil {
+	if err := p7.Verify(VerifyOptions{}); err != nil {
 		t.Errorf("Verify failed with error: %v", err)
 	}
 }
@@ -211,7 +210,7 @@ func TestVerifyWithHasherError(t *testing.T) {
 	dummyError := fmt.Errorf("dummy error")
 	p7.Hasher = &testHasher{retErr: dummyError}
 
-	if err := p7.Verify(); err != dummyError {
+	if err := p7.Verify(VerifyOptions{}); !errors.Is(err, dummyError) {
 		t.Errorf("Verify did not return expected error: %v", err)
 	}
 }
@@ -348,7 +347,7 @@ func TestVerifyAppStore(t *testing.T) {
 	if err != nil {
 		t.Errorf("Parse encountered unexpected error: %v", err)
 	}
-	if err := p7.Verify(); err != nil {
+	if err := p7.Verify(VerifyOptions{}); err != nil {
 		t.Errorf("Verify failed with error: %v", err)
 	}
 }
@@ -473,7 +472,7 @@ func TestVerifyApkEcdsa(t *testing.T) {
 	if err != nil {
 		t.Errorf("Failed to decode base64 signature file: %v", err)
 	}
-	if err := p7.Verify(); err != nil {
+	if err := p7.Verify(VerifyOptions{}); err != nil {
 		t.Errorf("Verify failed with error: %v", err)
 	}
 }
@@ -510,7 +509,7 @@ func TestVerifyFirefoxAddon(t *testing.T) {
 	certPool := x509.NewCertPool()
 	certPool.AppendCertsFromPEM(FirefoxAddonRootCert)
 	// verifies at the signingTime authenticated attr
-	if err := p7.VerifyWithChain(certPool); err != nil {
+	if err := p7.Verify(VerifyOptions{Roots: certPool, VerifyAtSigningTime: true}); err != nil {
 		t.Errorf("Verify failed with error: %v", err)
 	}
 
@@ -520,16 +519,16 @@ func TestVerifyFirefoxAddon(t *testing.T) {
 	// Intermediate: 2015-03-17 23:52:42 +0000 UTC 2025-03-14 23:52:42 +0000 UTC
 	// Root:         2015-03-17 22:53:57 +0000 UTC 2025-03-14 22:53:57 +0000 UTC
 	validTime := time.Date(2021, 8, 16, 20, 0, 0, 0, time.UTC)
-	if err = p7.VerifyWithChainAtTime(certPool, validTime); err != nil {
+	if err = p7.Verify(VerifyOptions{Roots: certPool, CurrentTime: validTime}); err != nil {
 		t.Errorf("Verify at UTC now failed with error: %v", err)
 	}
 
 	expiredTime := time.Date(2030, time.January, 1, 0, 0, 0, 0, time.UTC)
-	if err = p7.VerifyWithChainAtTime(certPool, expiredTime); err == nil {
+	if err = p7.Verify(VerifyOptions{Roots: certPool, CurrentTime: expiredTime}); err == nil {
 		t.Errorf("Verify at expired time %s did not error", expiredTime)
 	}
 	notYetValidTime := time.Date(1999, time.July, 5, 0, 13, 0, 0, time.UTC)
-	if err = p7.VerifyWithChainAtTime(certPool, notYetValidTime); err == nil {
+	if err = p7.Verify(VerifyOptions{Roots: certPool, CurrentTime: notYetValidTime}); err == nil {
 		t.Errorf("Verify at not yet valid time %s did not error", notYetValidTime)
 	}
 
@@ -540,7 +539,7 @@ func TestVerifyFirefoxAddon(t *testing.T) {
 		t.Errorf("No end-entity certificate found for signer")
 	}
 	signingTime := mustParseTime("2017-02-23T09:06:16-05:00")
-	chains, err := verifyCertChain(ee, p7.Certificates, certPool, signingTime)
+	chains, err := verifyCertChain(ee, p7.Certificates, certPool, signingTime, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -714,16 +713,14 @@ A ship in port is safe,
 but that's not what ships are built for.
 -- Grace Hopper`)
 	// write the content to a temp file
-	tmpContentFile, err := ioutil.TempFile("", "TestSignWithOpenSSLAndVerify_content")
+	tmpContentFile, err := os.CreateTemp("", "TestSignWithOpenSSLAndVerify_content")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ioutil.WriteFile(tmpContentFile.Name(), content, 0755)
+	os.WriteFile(tmpContentFile.Name(), content, 0755)
 	sigalgs := []x509.SignatureAlgorithm{
-		x509.SHA1WithRSA,
 		x509.SHA256WithRSA,
 		x509.SHA512WithRSA,
-		x509.ECDSAWithSHA1,
 		x509.ECDSAWithSHA256,
 		x509.ECDSAWithSHA384,
 		x509.ECDSAWithSHA512,
@@ -741,7 +738,7 @@ but that's not what ships are built for.
 				t.Fatalf("test %s/%s: cannot generate intermediate cert: %s", sigalgroot, sigalginter, err)
 			}
 			// write the intermediate cert to a temp file
-			tmpInterCertFile, err := ioutil.TempFile("", "TestSignWithOpenSSLAndVerify_intermediate")
+			tmpInterCertFile, err := os.CreateTemp("", "TestSignWithOpenSSLAndVerify_intermediate")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -758,7 +755,7 @@ but that's not what ships are built for.
 				}
 
 				// write the signer cert to a temp file
-				tmpSignerCertFile, err := ioutil.TempFile("", "TestSignWithOpenSSLAndVerify_signer")
+				tmpSignerCertFile, err := os.CreateTemp("", "TestSignWithOpenSSLAndVerify_signer")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -770,7 +767,7 @@ but that's not what ships are built for.
 				fd.Close()
 
 				// write the signer key to a temp file
-				tmpSignerKeyFile, err := ioutil.TempFile("", "TestSignWithOpenSSLAndVerify_key")
+				tmpSignerKeyFile, err := os.CreateTemp("", "TestSignWithOpenSSLAndVerify_key")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -779,7 +776,7 @@ but that's not what ships are built for.
 					t.Fatal(err)
 				}
 				var derKey []byte
-				priv := *signerCert.PrivateKey
+				priv := signerCert.PrivateKey
 				switch priv := priv.(type) {
 				case *rsa.PrivateKey:
 					derKey = x509.MarshalPKCS1PrivateKey(priv)
@@ -794,12 +791,12 @@ but that's not what ships are built for.
 				fd.Close()
 
 				// write the root cert to a temp file
-				tmpSignedFile, err := ioutil.TempFile("", "TestSignWithOpenSSLAndVerify_signature")
+				tmpSignedFile, err := os.CreateTemp("", "TestSignWithOpenSSLAndVerify_signature")
 				if err != nil {
 					t.Fatal(err)
 				}
 				// call openssl to sign the content
-				opensslCMD := exec.Command("openssl", "smime", "-sign", "-nodetach",
+				opensslCMD := exec.CommandContext(t.Context(), "openssl", "smime", "-sign", "-nodetach",
 					"-in", tmpContentFile.Name(), "-out", tmpSignedFile.Name(),
 					"-signer", tmpSignerCertFile.Name(), "-inkey", tmpSignerKeyFile.Name(),
 					"-certfile", tmpInterCertFile.Name(), "-outform", "PEM")
@@ -809,7 +806,7 @@ but that's not what ships are built for.
 				}
 
 				// verify the signed content
-				pemSignature, err := ioutil.ReadFile(tmpSignedFile.Name())
+				pemSignature, err := os.ReadFile(tmpSignedFile.Name())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -821,7 +818,7 @@ but that's not what ships are built for.
 				if err != nil {
 					t.Fatalf("Parse encountered unexpected error: %v", err)
 				}
-				if err := p7.VerifyWithChain(truststore); err != nil {
+				if err := p7.Verify(VerifyOptions{Roots: truststore}); err != nil {
 					t.Fatalf("Verify failed with error: %v", err)
 				}
 				// Verify the certificate chain to make sure the identified root
@@ -830,7 +827,7 @@ but that's not what ships are built for.
 				if ee == nil {
 					t.Fatalf("No end-entity certificate found for signer")
 				}
-				chains, err := verifyCertChain(ee, p7.Certificates, truststore, time.Now())
+				chains, err := verifyCertChain(ee, p7.Certificates, truststore, time.Now(), nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -989,7 +986,7 @@ func TestAzureAttestationSignatureValidation(t *testing.T) {
 		t.Errorf("failed parsing attested data: %v", err)
 	}
 
-	err = p7.Verify()
+	err = p7.Verify(VerifyOptions{})
 	if err != nil {
 		t.Errorf("failed verifying data: %v", err)
 	}

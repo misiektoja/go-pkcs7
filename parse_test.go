@@ -1,6 +1,3 @@
-//go:build go1.23
-// +build go1.23
-
 package pkcs7
 
 import (
@@ -27,12 +24,8 @@ func TestParseWindowsSCEPCertificateRequest(t *testing.T) {
 		t.Errorf("expected p7 to be nil; got %v", p7)
 	}
 
-	// enable the legacy parser when Go 1.23 or newer is used, and parse it again
-	SetFallbackLegacyX509CertificateParserEnabled(true)
-	t.Cleanup(func() {
-		SetFallbackLegacyX509CertificateParserEnabled(false)
-	})
-	p7, err = Parse(data)
+	// parse it again with the legacy certificate parser
+	p7, err = ParseWithOptions(data, ParseOptions{LegacyCertificateParser: true})
 	if err != nil {
 		t.Errorf("failed parsing SCEP request data with legacy X509 certificate parser enabled: %v", err)
 	}

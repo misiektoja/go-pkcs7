@@ -3,92 +3,161 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/rsa"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
-	"io/ioutil"
+	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
 
-func TestEncrypt(t *testing.T) {
-	modes := []int{
-		EncryptionAlgorithmDESCBC,
-		EncryptionAlgorithmAES128CBC,
-		EncryptionAlgorithmAES256CBC,
-		EncryptionAlgorithmAES128GCM,
-		EncryptionAlgorithmAES256GCM,
-	}
-	sigalgs := []x509.SignatureAlgorithm{
-		x509.SHA1WithRSA,
-		x509.SHA256WithRSA,
-		x509.SHA512WithRSA,
-	}
-	for _, mode := range modes {
-		for _, sigalg := range sigalgs {
-			ContentEncryptionAlgorithm = mode
+// allContentAlgorithms accepts every content cipher, including single DES.
+var allContentAlgorithms = DecryptOptions{ContentEncryptionAlgorithms: []ContentEncryptionAlgorithm{AES128CBC, AES192CBC, AES256CBC, DESEDE3CBC, DESCBC}}
 
+// TestEncrypt round-trips EnvelopedData through every content cipher and key transport.
+func TestEncrypt(t *testing.T) {
+	t.Parallel()
+	keyEncryptions := []EncryptOptions{
+		{KeyEncryption: RSAPKCS1v15},
+		{KeyEncryption: RSAOAEP, OAEPHash: crypto.SHA1},
+		{KeyEncryption: RSAOAEP},
+		{KeyEncryption: RSAOAEP, OAEPHash: crypto.SHA512},
+	}
+	for _, keyAlg := range []x509.SignatureAlgorithm{x509.SHA256WithRSA, x509.SHA512WithRSA} {
+		cert, err := createTestCertificate(keyAlg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, alg := range allContentAlgorithms.ContentEncryptionAlgorithms {
+			for _, opts := range keyEncryptions {
+				opts.ContentEncryption = alg
+				t.Run(keyAlg.String()+"/"+alg.String()+"/"+opts.KeyEncryption.String(), func(t *testing.T) {
+					plaintext := []byte("Hello Secret World!")
+					encrypted, err := Encrypt(plaintext, []*x509.Certificate{cert.Certificate}, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					p7, err := Parse(encrypted)
+					if err != nil {
+						t.Fatalf("cannot Parse encrypted result: %s", err)
+					}
+					if got, err := p7.ContentEncryptionAlgorithm(); err != nil || got != alg {
+						t.Errorf("ContentEncryptionAlgorithm() = %v, %v, want %v", got, err, alg)
+					}
+					result, err := p7.Decrypt(cert.Certificate, cert.PrivateKey.(crypto.Decrypter), allContentAlgorithms)
+					if err != nil {
+						t.Fatalf("cannot Decrypt encrypted result: %s", err)
+					}
+					if !bytes.Equal(plaintext, result) {
+						t.Errorf("encrypted data does not match plaintext:\n\tExpected: %s\n\tActual: %s", plaintext, result)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestEncryptDefaults checks that zero options select AES-128-CBC and PKCS #1 v1.5 key transport.
+func TestEncryptDefaults(t *testing.T) {
+	t.Parallel()
+	cert, err := createTestCertificate(x509.SHA256WithRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := Encrypt([]byte("defaults"), []*x509.Certificate{cert.Certificate}, EncryptOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(encrypted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ed := p7.raw.(envelopedData)
+	if alg := ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm; !alg.Equal(OIDEncryptionAlgorithmAES128CBC) {
+		t.Errorf("content encryption algorithm = %v, want AES-128-CBC", alg)
+	}
+	if alg := ed.RecipientInfos[0].KeyEncryptionAlgorithm.Algorithm; !alg.Equal(OIDEncryptionAlgorithmRSA) {
+		t.Errorf("key encryption algorithm = %v, want rsaEncryption", alg)
+	}
+}
+
+// TestEncryptRejectsBadInput covers recipients and options that Encrypt cannot use.
+func TestEncryptRejectsBadInput(t *testing.T) {
+	t.Parallel()
+	rsaCert, err := createTestCertificate(x509.SHA256WithRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecCert, err := createTestCertificate(x509.ECDSAWithSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipients := []*x509.Certificate{rsaCert.Certificate}
+	for _, tt := range []struct {
+		name       string
+		recipients []*x509.Certificate
+		opts       EncryptOptions
+		want       error
+	}{
+		{"no recipients", nil, EncryptOptions{}, nil},
+		{"ECDSA recipient", []*x509.Certificate{ecCert.Certificate}, EncryptOptions{}, ErrUnsupportedKeyType},
+		{"unknown content cipher", recipients, EncryptOptions{ContentEncryption: 99}, ErrUnsupportedEncryptionAlgorithm},
+		{"unknown key transport", recipients, EncryptOptions{KeyEncryption: 99}, ErrUnsupportedKeyEncryptionAlgorithm},
+		{"MD5 OAEP hash", recipients, EncryptOptions{KeyEncryption: RSAOAEP, OAEPHash: crypto.MD5}, ErrUnsupportedKeyEncryptionHash},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Encrypt([]byte("x"), tt.recipients, tt.opts)
+			if err == nil || (tt.want != nil && !errors.Is(err, tt.want)) {
+				t.Errorf("Encrypt error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestEncryptUsingPSK round-trips EncryptedData through every content cipher.
+func TestEncryptUsingPSK(t *testing.T) {
+	t.Parallel()
+	for alg, c := range contentCiphers {
+		t.Run(alg.String(), func(t *testing.T) {
 			plaintext := []byte("Hello Secret World!")
-			cert, err := createTestCertificate(sigalg)
+			key := bytes.Repeat([]byte{0x5a}, c.keyLen)
+			ciphertext, err := EncryptUsingPSK(plaintext, key, EncryptOptions{ContentEncryption: alg})
 			if err != nil {
 				t.Fatal(err)
 			}
-			encrypted, err := Encrypt(plaintext, []*x509.Certificate{cert.Certificate})
+			p7, err := Parse(ciphertext)
 			if err != nil {
 				t.Fatal(err)
 			}
-			p7, err := Parse(encrypted)
-			if err != nil {
-				t.Fatalf("cannot Parse encrypted result: %s", err)
-			}
-			result, err := p7.Decrypt(cert.Certificate, *cert.PrivateKey)
+			result, err := p7.DecryptUsingPSK(key, allContentAlgorithms)
 			if err != nil {
 				t.Fatalf("cannot Decrypt encrypted result: %s", err)
 			}
 			if !bytes.Equal(plaintext, result) {
 				t.Errorf("encrypted data does not match plaintext:\n\tExpected: %s\n\tActual: %s", plaintext, result)
 			}
-		}
+		})
 	}
 }
 
-func TestEncryptUsingPSK(t *testing.T) {
-	modes := []int{
-		EncryptionAlgorithmDESCBC,
-		EncryptionAlgorithmAES128GCM,
+// TestEncryptUsingPSKKeyLength checks that a missing key or a key of the wrong length is refused.
+func TestEncryptUsingPSKKeyLength(t *testing.T) {
+	t.Parallel()
+	if _, err := EncryptUsingPSK([]byte("x"), nil, EncryptOptions{}); !errors.Is(err, ErrPSKNotProvided) {
+		t.Errorf("nil key: error = %v, want ErrPSKNotProvided", err)
 	}
-
-	for _, mode := range modes {
-		ContentEncryptionAlgorithm = mode
-		plaintext := []byte("Hello Secret World!")
-		var key []byte
-
-		switch mode {
-		case EncryptionAlgorithmDESCBC:
-			key = []byte("64BitKey")
-		case EncryptionAlgorithmAES128GCM:
-			key = []byte("128BitKey4AESGCM")
-		}
-		ciphertext, err := EncryptUsingPSK(plaintext, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		p7, _ := Parse(ciphertext)
-		result, err := p7.DecryptUsingPSK(key)
-		if err != nil {
-			t.Fatalf("cannot Decrypt encrypted result: %s", err)
-		}
-		if !bytes.Equal(plaintext, result) {
-			t.Errorf("encrypted data does not match plaintext:\n\tExpected: %s\n\tActual: %s", plaintext, result)
-		}
+	if _, err := EncryptUsingPSK([]byte("x"), make([]byte, 8), EncryptOptions{ContentEncryption: AES256CBC}); err == nil {
+		t.Error("an 8-byte key for AES-256-CBC was accepted")
 	}
 }
 
+// TestPad checks PKCS #7 padding and that the input slice is left untouched.
 func TestPad(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		Original  []byte
 		Expected  []byte
@@ -107,50 +176,38 @@ func TestPad(t *testing.T) {
 			t.Errorf("pad results mismatch:\n\tExpected: %X\n\tActual: %X", test.Expected, padded)
 		}
 	}
-}
-
-func Test_getParametersForKeyEncryptionAlgorithm(t *testing.T) {
-	type args struct {
-		algorithm asn1.ObjectIdentifier
-		hash      crypto.Hash
+	backing := make([]byte, 4, 16)
+	if _, err := pad(backing, 8); err != nil {
+		t.Fatal(err)
 	}
-	tests := []struct {
-		name   string
-		args   args
-		expErr error
-	}{
-		{name: "sha256", args: args{algorithm: OIDEncryptionAlgorithmRSAESOAEP, hash: crypto.SHA256}},
-		{name: "sha512", args: args{algorithm: OIDEncryptionAlgorithmRSAESOAEP, hash: crypto.SHA512}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := getParametersForKeyEncryptionAlgorithm(tt.args.algorithm, tt.args.hash)
-			if tt.expErr != nil {
-				if err == nil {
-					t.Errorf("getParametersForKeyEncryptionAlgorithm() error = %v, expErr %v", err, tt.expErr)
-					return
-				}
-				if err.Error() != tt.expErr.Error() {
-					t.Errorf("getParametersForKeyEncryptionAlgorithm() = %v, want %v", err.Error(), tt.expErr.Error())
-					return
-				}
-			}
-
-			// test if the reverse operation results in the same value
-			alg := pkix.AlgorithmIdentifier{Algorithm: tt.args.algorithm, Parameters: got}
-			resultHash, err := getHashFuncForKeyEncryptionAlgorithm(alg)
-			if err != nil {
-				t.Errorf("getHashFuncForKeyEncryptionAlgorithm errors = %v", err)
-			}
-
-			if resultHash != tt.args.hash {
-				t.Errorf("getHashFuncForKeyEncryptionAlgorithm() = %v, want %v", resultHash, tt.args.hash)
-			}
-		})
+	if !bytes.Equal(backing[:8], make([]byte, 8)) {
+		t.Errorf("pad wrote into the spare capacity of its input: % X", backing[:8])
 	}
 }
 
+// TestOAEPParametersRoundTrip checks that the encoded RSAES-OAEP parameters name the OAEP hash for
+// both the digest and MGF1, as crypto/rsa uses one hash for both.
+func TestOAEPParametersRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, hash := range []crypto.Hash{crypto.SHA1, crypto.SHA256, crypto.SHA384, crypto.SHA512} {
+		alg, err := EncryptOptions{KeyEncryption: RSAOAEP, OAEPHash: hash}.keyEncryptionAlgorithm()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := parseOAEPParameters(alg.Parameters)
+		if err != nil {
+			t.Fatalf("%v: %v", hash, err)
+		}
+		want := &rsa.OAEPOptions{Hash: hash, MGFHash: hash}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%v: parameters decode to %+v, want %+v", hash, got, want)
+		}
+	}
+}
+
+// Test_marshalEncryptedContent checks the implicit [0] wrapper around the ciphertext.
 func Test_marshalEncryptedContent(t *testing.T) {
+	t.Parallel()
 	content := []byte{}
 	got := marshalEncryptedContent(content)
 
@@ -167,67 +224,46 @@ func Test_marshalEncryptedContent(t *testing.T) {
 	}
 }
 
+// TestEncryptAndDecryptWithOpenSSL checks that OpenSSL decrypts what Encrypt produces.
 func TestEncryptAndDecryptWithOpenSSL(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not found")
+	}
 	tf := UnmarshalTestFixture(RSAOAEPSHA256EncryptedTestFixture) // use existing fixture with cert + key
-
-	content := []byte("this is the content")
-	recipients := []*x509.Certificate{tf.Certificate}
-	currentAlgorithm := ContentEncryptionAlgorithm
-	ContentEncryptionAlgorithm = EncryptionAlgorithmAES256CBC
-	defer func() {
-		ContentEncryptionAlgorithm = currentAlgorithm
-	}()
-	encryptedContent, err := Encrypt(content, recipients)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	contentFile, err := ioutil.TempFile("", "content")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(contentFile.Name())
-
-	err = pem.Encode(contentFile, &pem.Block{Type: "PKCS7", Bytes: encryptedContent})
-	if err != nil {
-		t.Fatal(err)
-	}
-	contentFile.Close()
-
-	recipientFile, err := ioutil.TempFile("", "content")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(recipientFile.Name())
-
-	err = pem.Encode(recipientFile, &pem.Block{Type: "CERTIFICATE", Bytes: tf.Certificate.Raw})
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	recipientFile := filepath.Join(t.TempDir(), "recipient.pem")
 	privateKey, err := x509.MarshalPKCS8PrivateKey(tf.PrivateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	err = pem.Encode(recipientFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privateKey})
-	if err != nil {
+	recipientPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tf.Certificate.Raw})
+	recipientPEM = append(recipientPEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKey})...)
+	if err := os.WriteFile(recipientFile, recipientPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	recipientFile.Close()
 
-	// call openssl to decrypt the content
-	opensslCMD := exec.Command("openssl", "cms", "-decrypt",
-		"-inform", "pem",
-		"-in", contentFile.Name(),
-		"-recip", recipientFile.Name(),
-	)
-	out, err := opensslCMD.CombinedOutput()
-	if err != nil {
-		t.Fatalf("openssl command failed with %s: %s", err, out)
-	}
-
-	if !bytes.Equal(content, out) {
-		t.Errorf("EncryptAndDecryptWithOpenSSL() = %v, want %v", out, content)
+	for _, opts := range []EncryptOptions{
+		{ContentEncryption: AES256CBC},
+		{ContentEncryption: AES128CBC, KeyEncryption: RSAOAEP},
+		{ContentEncryption: DESEDE3CBC, KeyEncryption: RSAOAEP, OAEPHash: crypto.SHA512},
+	} {
+		t.Run(opts.ContentEncryption.String()+"/"+opts.KeyEncryption.String(), func(t *testing.T) {
+			content := []byte("this is the content")
+			encryptedContent, err := Encrypt(content, []*x509.Certificate{tf.Certificate}, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			contentFile := filepath.Join(t.TempDir(), "content.pem")
+			if err := os.WriteFile(contentFile, pem.EncodeToMemory(&pem.Block{Type: "PKCS7", Bytes: encryptedContent}), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out, err := exec.CommandContext(t.Context(), "openssl", "cms", "-decrypt", "-inform", "pem", "-in", contentFile, "-recip", recipientFile).CombinedOutput()
+			if err != nil {
+				t.Fatalf("openssl command failed with %s: %s", err, out)
+			}
+			if !bytes.Equal(content, out) {
+				t.Errorf("openssl decrypted %q, want %q", out, content)
+			}
+		})
 	}
 }

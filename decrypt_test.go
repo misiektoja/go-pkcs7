@@ -2,9 +2,19 @@ package pkcs7
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"errors"
+	"strings"
 	"testing"
 )
 
+// TestDecrypt decrypts messages that OpenSSL produced with each key transport.
 func TestDecrypt(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -39,7 +49,7 @@ func TestDecrypt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			content, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey)
+			content, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey, DecryptOptions{})
 			if err != nil {
 				t.Errorf("cannot Decrypt with error: %v", err)
 			}
@@ -50,9 +60,239 @@ func TestDecrypt(t *testing.T) {
 	}
 }
 
-// TODO: use `embed` (after upping Go to at least 1.16), so that
-// it's easier to work with the files used to generate the below
-// test fixtures.
+// TestUnpad covers PKCS #7 padding removal for 8-byte and 16-byte blocks.
+func TestUnpad(t *testing.T) {
+	t.Parallel()
+	for _, blockSize := range []int{8, 16} {
+		for _, tt := range []struct {
+			name    string
+			data    []byte
+			want    []byte
+			wantErr bool
+		}{
+			{"empty", nil, nil, true},
+			{"unaligned", make([]byte, blockSize-1), nil, true},
+			{"zero padding byte", make([]byte, blockSize), nil, true},
+			{"padding longer than the input", bytes.Repeat([]byte{255}, blockSize), nil, true},
+			{"padding longer than a block", bytes.Repeat([]byte{byte(blockSize + 1)}, 2*blockSize), nil, true},
+			{"inconsistent padding", append(make([]byte, blockSize-1), 2), nil, true},
+			{"one padding byte", append(make([]byte, blockSize-1), 1), make([]byte, blockSize-1), false},
+			{"a whole block of padding", bytes.Repeat([]byte{byte(blockSize)}, blockSize), []byte{}, false},
+		} {
+			got, err := unpad(tt.data, blockSize)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("%d/%s: unpad error = %v, want error %v", blockSize, tt.name, err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, ErrDecryptionFailed) {
+				t.Errorf("%d/%s: unpad error = %v, want ErrDecryptionFailed", blockSize, tt.name, err)
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("%d/%s: unpad = % X, want % X", blockSize, tt.name, got, tt.want)
+			}
+		}
+	}
+	if _, err := unpad([]byte{1}, 0); err == nil {
+		t.Error("unpad accepted a zero block size")
+	}
+}
+
+// encryptedFixture builds an EnvelopedData message for the test certificate whose encrypted
+// content and IV the caller chooses, so tests can feed Decrypt malformed ciphertext.
+func encryptedFixture(t *testing.T, cert *x509.Certificate, alg asn1.ObjectIdentifier, key, iv, ciphertext []byte) *PKCS7 {
+	t.Helper()
+	wrapped, err := rsa.EncryptPKCS1v15(rand.Reader, cert.PublicKey.(*rsa.PublicKey), key) //nolint:staticcheck // the fixture needs PKCS #1 v1.5 key transport.
+	if err != nil {
+		t.Fatal(err)
+	}
+	ed := envelopedData{
+		RecipientInfos: []recipientInfo{{
+			IssuerAndSerialNumber:  cert2issuerAndSerial(cert),
+			KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: OIDEncryptionAlgorithmRSA, Parameters: asn1.NullRawValue},
+			EncryptedKey:           wrapped,
+		}},
+		EncryptedContentInfo: encryptedContentInfo{
+			ContentType:                OIDData,
+			ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: alg, Parameters: asn1.RawValue{Tag: asn1.TagOctetString, Bytes: iv}},
+			EncryptedContent:           marshalEncryptedContent(ciphertext),
+		},
+	}
+	inner, err := asn1.Marshal(ed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := asn1.Marshal(contentInfo{ContentType: OIDEnvelopedData, Content: asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: inner}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p7
+}
+
+// TestDecryptPadding checks that bad CBC padding and partial blocks are refused after decryption.
+func TestDecryptPadding(t *testing.T) {
+	t.Parallel()
+	fixture := UnmarshalTestFixture(EncryptedTestFixture)
+	key := make([]byte, 16)
+	iv := make([]byte, aes.BlockSize)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name    string
+		last    byte
+		length  int
+		wantErr string
+	}{
+		{"valid", 1, aes.BlockSize, ""},
+		{"padding byte 255", 255, aes.BlockSize, "decryption failed"},
+		{"padding byte 0", 0, aes.BlockSize, "decryption failed"},
+		{"partial block", 1, aes.BlockSize + 3, "whole number of cipher blocks"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			plaintext := make([]byte, aes.BlockSize)
+			plaintext[len(plaintext)-1] = tt.last
+			ciphertext := make([]byte, tt.length)
+			cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext[:aes.BlockSize], plaintext)
+			p7 := encryptedFixture(t, fixture.Certificate, OIDEncryptionAlgorithmAES128CBC, key, iv, ciphertext)
+			got, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey, DecryptOptions{})
+			if tt.wantErr == "" {
+				if err != nil || !bytes.Equal(got, plaintext[:len(plaintext)-1]) {
+					t.Fatalf("Decrypt = % X, %v", got, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Decrypt error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestDecryptRejects covers inputs Decrypt must refuse without revealing which step failed.
+func TestDecryptRejects(t *testing.T) {
+	t.Parallel()
+	fixture := UnmarshalTestFixture(EncryptedTestFixture)
+	plaintext := []byte("This is a test")
+
+	desMessage, err := Encrypt(plaintext, []*x509.Certificate{fixture.Certificate}, EncryptOptions{ContentEncryption: DESCBC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(desMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey, DecryptOptions{}); !errors.Is(err, ErrContentEncryptionNotAllowed) {
+		t.Errorf("single DES by default: error = %v, want a refusal", err)
+	}
+	if got, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey, DecryptOptions{ContentEncryptionAlgorithms: []ContentEncryptionAlgorithm{DESCBC}}); err != nil || !bytes.Equal(got, plaintext) {
+		t.Errorf("single DES when allowed: Decrypt = %q, %v", got, err)
+	}
+
+	aesMessage, err := Encrypt(plaintext, []*x509.Certificate{fixture.Certificate}, EncryptOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err = Parse(aesMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey, DecryptOptions{ContentEncryptionAlgorithms: []ContentEncryptionAlgorithm{AES256CBC}}); err == nil {
+		t.Error("AES-128-CBC was accepted although only AES-256-CBC was allowed")
+	}
+
+	// A corrupted encrypted key must look the same as a wrong key: the PKCS #1 v1.5 padding failure
+	// is replaced by a random content key. Content decryption then reports the generic error or, when
+	// the random key happens to yield valid padding, returns garbage.
+	ed := p7.raw.(envelopedData)
+	ed.RecipientInfos[0].EncryptedKey = bytes.Clone(ed.RecipientInfos[0].EncryptedKey)
+	ed.RecipientInfos[0].EncryptedKey[10] ^= 0xff
+	tampered := &PKCS7{raw: ed}
+	got, err := tampered.Decrypt(fixture.Certificate, fixture.PrivateKey, DecryptOptions{})
+	if (err == nil && bytes.Equal(got, plaintext)) || (err != nil && !errors.Is(err, ErrDecryptionFailed)) {
+		t.Fatalf("corrupted key: Decrypt = %q, %v, want ErrDecryptionFailed or garbage", got, err)
+	}
+
+	other, err := createTestCertificate(x509.SHA256WithRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p7.Decrypt(other.Certificate, other.PrivateKey.(*rsa.PrivateKey), DecryptOptions{}); err == nil {
+		t.Error("Decrypt succeeded for a certificate that is not a recipient")
+	}
+}
+
+// TestRecipients checks that every recipient of an EnvelopedData message is listed by issuer and
+// serial number, and that other content types are refused.
+func TestRecipients(t *testing.T) {
+	t.Parallel()
+	first, err := createTestCertificate(x509.SHA256WithRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := createTestCertificate(x509.SHA256WithRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certs := []*x509.Certificate{first.Certificate, second.Certificate}
+	message, err := Encrypt([]byte("content"), certs, EncryptOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipients, err := p7.Recipients()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recipients) != len(certs) {
+		t.Fatalf("Recipients() returned %d recipients, want %d", len(recipients), len(certs))
+	}
+	for i, cert := range certs {
+		if !bytes.Equal(recipients[i].Issuer, cert.RawIssuer) || recipients[i].SerialNumber.Cmp(cert.SerialNumber) != 0 {
+			t.Errorf("recipient %d does not identify certificate %d", i, i)
+		}
+	}
+
+	signed, err := NewSignedData([]byte("content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := signed.AddSigner(first.Certificate, first.PrivateKey, SignerInfoConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	der, err := signed.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p7, err = Parse(der); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p7.Recipients(); !errors.Is(err, ErrNotEncryptedContent) {
+		t.Errorf("Recipients() on SignedData: error = %v, want ErrNotEncryptedContent", err)
+	}
+}
+
+// TestContentEncryptionAlgorithmNames checks the names and the zero-value handling of the
+// algorithm types.
+func TestContentEncryptionAlgorithmNames(t *testing.T) {
+	t.Parallel()
+	if got := AES128CBC.String(); got != "AES-128-CBC" {
+		t.Errorf("AES128CBC.String() = %q", got)
+	}
+	if got := ContentEncryptionAlgorithm(0).String(); got != "ContentEncryptionAlgorithm(0)" {
+		t.Errorf("zero value String() = %q", got)
+	}
+	if got := KeyEncryptionAlgorithm(7).String(); got != "KeyEncryptionAlgorithm(7)" {
+		t.Errorf("unknown key encryption String() = %q", got)
+	}
+}
 
 // echo -n "This is a test" > test.txt
 // openssl cms -encrypt -in test.txt cert.pem
@@ -230,18 +470,22 @@ J1h1Q5Z6frEwd4ye/bcpReEScPXOKEB+1b3TWGCWNC2jhfChtZSH1Y3Z3mL0SfwT
 n9txBjxLOx1G83OQYY3J6Bnwkn5/whXGdMlfOR963adQNweQuatB
 -----END RSA PRIVATE KEY-----`
 
+// RSAOAEPSHA256EncryptedTestFixture reuses the certificate and key of the signing fixtures. The
+// message was made with OpenSSL 4.1, which names SHA-256 for both the OAEP hash and MGF1:
+//
+//	openssl cms -encrypt -in test.txt -binary -outform pem -recip cert.pem -aes256 -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
 var RSAOAEPSHA256EncryptedTestFixture = `
 -----BEGIN PKCS7-----
-MIIBtgYJKoZIhvcNAQcDoIIBpzCCAaMCAQAxggFeMIIBWgIBADAxMCkxEDAOBgNV
-BAoTB0FjbWUgQ28xFTATBgNVBAMTDEVkZGFyZCBTdGFyawIEItzA4TAeBgkqhkiG
-9w0BAQcwEaAPMA0GCWCGSAFlAwQCAQUABIIBAFI8WCPbFK8sEkWFZKtcla39k0DA
-HL+iS16Is+6lKFpanTq1L1DUYfdNJe1raRy/0aHV7sOnugIXyMo5daKOqyJlcgr/
-UR9iTu1mUADX+F3W/IeIIBrsFI73PsW30yk8uazjCGOh79TAmwjLSUMy/IV1LNKf
-mZEzfyaB8EEx1br7kW4tQ+DjW2VqMzKdVxNgzhrTR+VLiBkuGVGsdSEfFkJAYfhp
-4kcqzsE+VZ93v0wnB7g0r9GckBox0OWeYHsldkOQPA6OrGL/54MxxcOdh0mh0i2l
-azux8yBteKsUJG9y+J78DFBwZtOsy4u2Rat895K31GDew3sgHofeeFNHA8kwPAYJ
-KoZIhvcNAQcBMB0GCWCGSAFlAwQBKgQQ4bmABhs/EKBtcfYEwHk2wIAQuA3tdOYV
-oKGnb5jFQi17VA==
+MIIB0AYJKoZIhvcNAQcDoIIBwTCCAb0CAQAxggF4MIIBdAIBADAxMCkxEDAOBgNV
+BAoTB0FjbWUgQ28xFTATBgNVBAMTDEVkZGFyZCBTdGFyawIEItzA4TA4BgkqhkiG
+9w0BAQcwK6ANMAsGCWCGSAFlAwQCAaEaMBgGCSqGSIb3DQEBCDALBglghkgBZQME
+AgEEggEACXHLwG4XdLm3jZY5J9OAP0PNJNKDVlsV3jbTVEXSj1XYDJt9pLffePQ4
+y2IoAfhzriH/gIEk85DNz7d31qX8C/YmlGaW+dapIzfC+AB+5RfHz+Jdb7nHkeP5
++LiKWv+enCZh+78vAHOzGbMlLkTMXWPjuxMEVPnYJcsQJtF0LdwJZV2+GN89KVyy
+16/ctujA2hOCB2ZvwU93/C7VL4rmbs2HHbjnj2wN44TiSnFJJkGcCPMi5ZMHVNvH
+hf9AopHY2Z2KU7wX+5xm6YdxKNdn16gV8w2mLCHNKHLGJZhvvRJCzJsm6P82P6vJ
+cufFeqlCLLjbIF1x2pkGpwhHhNDzrzA8BgkqhkiG9w0BBwEwHQYJYIZIAWUDBAEq
+BBAN9tto4IqmHKYa6vLt3lCsgBDYOjTBEGyQ+jhSybGK/h2m
 -----END PKCS7-----
 -----BEGIN CERTIFICATE-----
 MIIDETCCAfmgAwIBAgIEItzA4TANBgkqhkiG9w0BAQsFADApMRAwDgYDVQQKEwdB
