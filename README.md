@@ -9,8 +9,8 @@
 
 go-pkcs7 is a Go library that parses and builds the parts of the Cryptographic Message Syntax
 (CMS, RFC 5652) that certificate enrollment protocols use. SCEP (RFC 8894) wraps every request and
-response in these messages, and [go-scep](https://github.com/misiektoja/go-scep) is built on this
-library.
+response in these messages. [go-pki-scep](https://github.com/misiektoja/go-pki-scep) is built on
+this library.
 
 It signs and verifies SignedData, encrypts and decrypts EnvelopedData for RSA recipients and
 encrypts and decrypts EncryptedData with a pre-shared key. Algorithm choices are made per call
