@@ -1,0 +1,23 @@
+title = "go-pkcs7"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Paths that never enter the repository or that hold build output only"
+paths = [
+  # Ignored directories checked for tracked files by the gitleaks Make target.
+  '''^\.cache/''',
+  '''^dist/''',
+  # Downloaded tool binaries.
+  '''^bin/''',
+]
+
+[[allowlists]]
+description = "Throwaway RSA, ECDSA and DSA keys that the tests and their upstream versions use as fixtures"
+targetRules = ["private-key"]
+paths = [
+  '''^[a-z0-9_.]+_test\.go$''',
+  # The DSA tests had this name in fullsailor/pkcs7.
+  '''^verify_test_dsa\.go$''',
+]

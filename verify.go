@@ -3,53 +3,65 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
-// Verify is a wrapper around VerifyWithChain() that initializes an empty
-// trust store, effectively disabling certificate verification when validating
-// a signature.
-func (p7 *PKCS7) Verify() (err error) {
-	return p7.VerifyWithChain(nil)
+// ErrAttributeNotFound is returned when a requested signed attribute is absent.
+var ErrAttributeNotFound = errors.New("pkcs7: attribute type not in attributes")
+
+// VerifyOptions controls the checks Verify makes.
+type VerifyOptions struct {
+	// Roots holds the trust anchors for signer certificate chains. When nil, Verify checks the
+	// signatures but builds no chain, so the caller must decide whether to trust the signer.
+	Roots *x509.CertPool
+
+	// Intermediates holds certificates that may complete a signer chain, in addition to the
+	// certificates carried in the message.
+	Intermediates []*x509.Certificate
+
+	// SignerCertificates holds candidate signer certificates for messages that do not carry their
+	// signer certificate. Some SCEP servers send responses without one.
+	SignerCertificates []*x509.Certificate
+
+	// CurrentTime is the time at which chains are checked. When zero, the current time is used,
+	// unless VerifyAtSigningTime applies.
+	CurrentTime time.Time
+
+	// VerifyAtSigningTime checks chains at the time in the signing-time attribute when CurrentTime
+	// is zero. The signer chooses that time, so set it only for archived signatures whose signing
+	// time is trusted.
+	VerifyAtSigningTime bool
+
+	// KeyUsages lists the extended key usages a signer chain must allow. When empty, any usage is
+	// accepted.
+	KeyUsages []x509.ExtKeyUsage
+
+	// AllowMD5 accepts signers that use the MD5 digest. Some old SCEP clients still do.
+	AllowMD5 bool
 }
 
-// VerifyWithChain checks the signatures of a PKCS7 object.
-//
-// If truststore is not nil, it also verifies the chain of trust of
-// the end-entity signer cert to one of the roots in the
-// truststore. When the PKCS7 object includes the signing time
-// authenticated attr verifies the chain at that time and UTC now
-// otherwise.
-func (p7 *PKCS7) VerifyWithChain(truststore *x509.CertPool) (err error) {
+// Verify checks every signer of a SignedData message: the message digest, the signed attributes,
+// the signature and, when opts.Roots is set, the signer certificate chain. For a detached
+// signature, set p7.Content to the signed data first.
+func (p7 *PKCS7) Verify(opts VerifyOptions) error {
+	sd, ok := p7.raw.(signedData)
+	if !ok {
+		return errors.New("pkcs7: payload is not signedData content")
+	}
 	if len(p7.Signers) == 0 {
-		return errors.New("pkcs7: Message has no signers")
+		return errors.New("pkcs7: message has no signers")
 	}
 	for _, signer := range p7.Signers {
-		if err := verifySignature(p7, signer, truststore); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// VerifyWithChainAtTime checks the signatures of a PKCS7 object.
-//
-// If truststore is not nil, it also verifies the chain of trust of
-// the end-entity signer cert to a root in the truststore at
-// currentTime. It does not use the signing time authenticated
-// attribute.
-func (p7 *PKCS7) VerifyWithChainAtTime(truststore *x509.CertPool, currentTime time.Time) (err error) {
-	if len(p7.Signers) == 0 {
-		return errors.New("pkcs7: Message has no signers")
-	}
-	for _, signer := range p7.Signers {
-		if err := verifySignatureAtTime(p7, signer, truststore, currentTime); err != nil {
+		if err := verifySigner(p7, sd.ContentInfo.ContentType, signer, opts); err != nil {
 			return err
 		}
 	}
@@ -64,6 +76,7 @@ type SigningTimeNotValidError struct {
 	NotAfter    time.Time // NotAfter of signer
 }
 
+// Error implements error.
 func (e *SigningTimeNotValidError) Error() string {
 	return fmt.Sprintf("pkcs7: signing time %q is outside of certificate validity %q to %q",
 		e.SigningTime.Format(time.RFC3339),
@@ -71,25 +84,32 @@ func (e *SigningTimeNotValidError) Error() string {
 		e.NotAfter.Format(time.RFC3339))
 }
 
-func verifySignatureAtTime(p7 *PKCS7, signer signerInfo, truststore *x509.CertPool, currentTime time.Time) (err error) {
-	signedData := p7.Content
+// verifySigner checks one signer of a SignedData message.
+func verifySigner(p7 *PKCS7, contentType asn1.ObjectIdentifier, signer signerInfo, opts VerifyOptions) error {
 	ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
 	if ee == nil {
-		return errors.New("pkcs7: No certificate for signer")
+		ee = getCertFromCertsByIssuerAndSerial(opts.SignerCertificates, signer.IssuerAndSerialNumber)
 	}
+	if ee == nil {
+		return errors.New("pkcs7: no certificate for signer")
+	}
+	hash, err := signerDigestHash(signer.DigestAlgorithm.Algorithm)
+	if err != nil {
+		return err
+	}
+	if hash == crypto.MD5 && !opts.AllowMD5 {
+		return errors.New("pkcs7: signer uses the MD5 digest, which is not allowed")
+	}
+
+	signed := p7.Content
+	var signingTime time.Time
 	if len(signer.AuthenticatedAttributes) > 0 {
-		// TODO(fullsailor): First check the content type match
-		var (
-			digest      []byte
-			signingTime time.Time
-		)
-		err := unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeMessageDigest, &digest)
-		if err != nil {
+		if err := checkContentTypeAttribute(signer.AuthenticatedAttributes, contentType); err != nil {
 			return err
 		}
-		hash, err := getHashForOID(signer.DigestAlgorithm.Algorithm)
-		if err != nil {
-			return err
+		var digest []byte
+		if err := unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeMessageDigest, &digest); err != nil {
+			return fmt.Errorf("pkcs7: message-digest attribute: %w", err)
 		}
 		computed, err := calculateHash(p7.Hasher, hash, p7.Content)
 		if err != nil {
@@ -101,90 +121,162 @@ func verifySignatureAtTime(p7 *PKCS7, signer signerInfo, truststore *x509.CertPo
 				ActualDigest:   computed,
 			}
 		}
-		signedData, err = marshalAttributes(signer.AuthenticatedAttributes)
+		signed, err = encodeSignedAttributes(signer.AuthenticatedAttributes)
 		if err != nil {
 			return err
 		}
-		err = unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeSigningTime, &signingTime)
-		if err == nil {
-			// signing time found, performing validity check
-			if signingTime.After(ee.NotAfter) || signingTime.Before(ee.NotBefore) {
-				return &SigningTimeNotValidError{
-					SigningTime: signingTime,
-					NotBefore:   ee.NotBefore,
-					NotAfter:    ee.NotAfter,
-				}
+		switch err := unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeSigningTime, &signingTime); {
+		case errors.Is(err, ErrAttributeNotFound):
+		case err != nil:
+			return fmt.Errorf("pkcs7: signing-time attribute: %w", err)
+		case signingTime.After(ee.NotAfter) || signingTime.Before(ee.NotBefore):
+			return &SigningTimeNotValidError{
+				SigningTime: signingTime,
+				NotBefore:   ee.NotBefore,
+				NotAfter:    ee.NotAfter,
 			}
 		}
 	}
-	if truststore != nil {
-		_, err = verifyCertChain(ee, p7.Certificates, truststore, currentTime)
-		if err != nil {
-			return err
-		}
-	}
-	sigalg, err := getSignatureAlgorithm(signer.DigestEncryptionAlgorithm, signer.DigestAlgorithm)
-	if err != nil {
+
+	if err := checkSignature(ee.PublicKey, signer, hash, signed); err != nil {
 		return err
 	}
-	return ee.CheckSignature(sigalg, signedData, signer.EncryptedDigest)
+	if opts.Roots == nil {
+		return nil
+	}
+	currentTime := opts.CurrentTime
+	if currentTime.IsZero() && opts.VerifyAtSigningTime {
+		currentTime = signingTime
+	}
+	intermediates := slices.Concat(p7.Certificates, opts.Intermediates)
+	_, err = verifyCertChain(ee, intermediates, opts.Roots, currentTime, opts.KeyUsages)
+	return err
 }
 
-func verifySignature(p7 *PKCS7, signer signerInfo, truststore *x509.CertPool) (err error) {
-	signedData := p7.Content
-	ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
-	if ee == nil {
-		return errors.New("pkcs7: No certificate for signer")
+// signerDigestHash returns the hash a signer digest algorithm names. Some signers, such as the
+// Azure instance metadata attestation service, put a PKCS #1 v1.5 signature algorithm there.
+func signerDigestHash(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
+	for hash, signatureOID := range rsaSignatureAlgorithms {
+		if oid.Equal(signatureOID) {
+			return hash, nil
+		}
 	}
-	signingTime := time.Now().UTC()
-	if len(signer.AuthenticatedAttributes) > 0 {
-		// TODO(fullsailor): First check the content type match
-		var digest []byte
-		err := unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeMessageDigest, &digest)
-		if err != nil {
-			return err
-		}
-		hash, err := getHashForOID(signer.DigestAlgorithm.Algorithm)
-		if err != nil {
-			return err
-		}
-		computed, err := calculateHash(p7.Hasher, hash, p7.Content)
-		if err != nil {
-			return err
-		}
-		if subtle.ConstantTimeCompare(digest, computed) != 1 {
-			return &MessageDigestMismatchError{
-				ExpectedDigest: digest,
-				ActualDigest:   computed,
+	return getHashForOID(oid)
+}
+
+// checkContentTypeAttribute enforces RFC 5652 section 5.3: signed attributes carry exactly one
+// content-type attribute, equal to the encapsulated content type.
+func checkContentTypeAttribute(attrs []attribute, contentType asn1.ObjectIdentifier) error {
+	var signedType asn1.ObjectIdentifier
+	if err := unmarshalAttribute(attrs, OIDAttributeContentType, &signedType); err != nil {
+		return fmt.Errorf("pkcs7: content-type attribute: %w", err)
+	}
+	if !signedType.Equal(contentType) {
+		return fmt.Errorf("pkcs7: content-type attribute %v does not match the content type %v", signedType, contentType)
+	}
+	return nil
+}
+
+// checkSignature verifies a signer's signature over signed with the signer public key.
+func checkSignature(pub crypto.PublicKey, signer signerInfo, hash crypto.Hash, signed []byte) error {
+	h := hash.New()
+	h.Write(signed)
+	digest := h.Sum(nil)
+	alg := signer.DigestEncryptionAlgorithm.Algorithm
+	switch pub := pub.(type) {
+	case *rsa.PublicKey:
+		switch {
+		case alg.Equal(OIDEncryptionAlgorithmRSASSAPSS):
+			saltLength, err := pssSaltLength(signer.DigestEncryptionAlgorithm.Parameters, hash)
+			if err != nil {
+				return err
 			}
-		}
-		signedData, err = marshalAttributes(signer.AuthenticatedAttributes)
-		if err != nil {
-			return err
-		}
-		err = unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeSigningTime, &signingTime)
-		if err == nil {
-			// signing time found, performing validity check
-			if signingTime.After(ee.NotAfter) || signingTime.Before(ee.NotBefore) {
-				return &SigningTimeNotValidError{
-					SigningTime: signingTime,
-					NotBefore:   ee.NotBefore,
-					NotAfter:    ee.NotAfter,
-				}
+			pssOpts := &rsa.PSSOptions{SaltLength: saltLength, Hash: hash}
+			if err := rsa.VerifyPSS(pub, hash, digest, signer.EncryptedDigest, pssOpts); err != nil {
+				return fmt.Errorf("pkcs7: signature verification failed: %w", err)
 			}
+			return nil
+		case alg.Equal(OIDEncryptionAlgorithmRSA) || alg.Equal(rsaSignatureAlgorithms[hash]):
+			if err := rsa.VerifyPKCS1v15(pub, hash, digest, signer.EncryptedDigest); err != nil {
+				return fmt.Errorf("pkcs7: signature verification failed: %w", err)
+			}
+			return nil
 		}
-	}
-	if truststore != nil {
-		_, err = verifyCertChain(ee, p7.Certificates, truststore, signingTime)
-		if err != nil {
-			return err
+	case *ecdsa.PublicKey:
+		// Some signers name the curve instead of the ECDSA signature algorithm.
+		if alg.Equal(ecdsaSignatureAlgorithms[hash]) || alg.Equal(OIDEncryptionAlgorithmECDSAP256) ||
+			alg.Equal(OIDEncryptionAlgorithmECDSAP384) || alg.Equal(OIDEncryptionAlgorithmECDSAP521) {
+			if !ecdsa.VerifyASN1(pub, digest, signer.EncryptedDigest) {
+				return errors.New("pkcs7: signature verification failed: ECDSA verification failure")
+			}
+			return nil
 		}
+	default:
+		return fmt.Errorf("pkcs7: unsupported signer key type %T", pub)
 	}
-	sigalg, err := getSignatureAlgorithm(signer.DigestEncryptionAlgorithm, signer.DigestAlgorithm)
+	return fmt.Errorf("pkcs7: signature algorithm %v cannot be used with digest %v and key type %T", alg, hash, pub)
+}
+
+// pssParameters is RSASSA-PSS-params from RFC 4055 section 3.1.
+type pssParameters struct {
+	Hash         pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:0"`
+	MGF          pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:1"`
+	SaltLength   int                      `asn1:"optional,explicit,tag:2,default:20"`
+	TrailerField int                      `asn1:"optional,explicit,tag:3,default:1"`
+}
+
+// pssSaltLength decodes RSASSA-PSS parameters and returns the salt length. The parameter hash and
+// the MGF1 hash must both equal the signer digest, because crypto/rsa uses one hash for both.
+func pssSaltLength(params asn1.RawValue, hash crypto.Hash) (int, error) {
+	if len(params.FullBytes) == 0 {
+		return 0, errors.New("pkcs7: RSASSA-PSS signature without parameters")
+	}
+	var p pssParameters
+	rest, err := asn1.Unmarshal(params.FullBytes, &p)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("pkcs7: malformed RSASSA-PSS parameters: %w", err)
 	}
-	return ee.CheckSignature(sigalg, signedData, signer.EncryptedDigest)
+	if len(rest) > 0 {
+		return 0, errors.New("pkcs7: trailing data after RSASSA-PSS parameters")
+	}
+	paramHash, mgfHash, err := parseHashAndMGF(p.Hash, p.MGF)
+	if err != nil {
+		return 0, err
+	}
+	if paramHash != hash || mgfHash != hash {
+		return 0, fmt.Errorf("pkcs7: RSASSA-PSS hashes %v and %v do not match the digest %v", paramHash, mgfHash, hash)
+	}
+	if p.TrailerField != 1 || p.SaltLength < 0 {
+		return 0, errors.New("pkcs7: unsupported RSASSA-PSS parameters")
+	}
+	return p.SaltLength, nil
+}
+
+// parseHashAndMGF decodes the hash and MGF1 hash of RSASSA-PSS or RSAES-OAEP parameters. Absent
+// fields take the SHA-1 defaults from RFC 8017.
+func parseHashAndMGF(hashAlg, mgfAlg pkix.AlgorithmIdentifier) (crypto.Hash, crypto.Hash, error) {
+	hash := crypto.SHA1
+	if len(hashAlg.Algorithm) > 0 {
+		var err error
+		if hash, err = getHashForOID(hashAlg.Algorithm); err != nil || hash == crypto.MD5 {
+			return 0, 0, fmt.Errorf("pkcs7: unsupported RSA parameter hash %v", hashAlg.Algorithm)
+		}
+	}
+	mgfHash := crypto.SHA1
+	if len(mgfAlg.Algorithm) > 0 {
+		if !mgfAlg.Algorithm.Equal(OIDMaskGenerationFunctionMGF1) {
+			return 0, 0, fmt.Errorf("pkcs7: unsupported mask generation function %v", mgfAlg.Algorithm)
+		}
+		var mgfHashAlg pkix.AlgorithmIdentifier
+		rest, err := asn1.Unmarshal(mgfAlg.Parameters.FullBytes, &mgfHashAlg)
+		if err != nil || len(rest) > 0 {
+			return 0, 0, errors.New("pkcs7: malformed MGF1 parameters")
+		}
+		if mgfHash, err = getHashForOID(mgfHashAlg.Algorithm); err != nil || mgfHash == crypto.MD5 {
+			return 0, 0, fmt.Errorf("pkcs7: unsupported MGF1 hash %v", mgfHashAlg.Algorithm)
+		}
+	}
+	return hash, mgfHash, nil
 }
 
 // GetOnlySigner returns an x509.Certificate for the first signer of the signed
@@ -197,8 +289,9 @@ func (p7 *PKCS7) GetOnlySigner() *x509.Certificate {
 	return getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
 }
 
-// UnmarshalSignedAttribute decodes a single attribute from the signer info
-func (p7 *PKCS7) UnmarshalSignedAttribute(attributeType asn1.ObjectIdentifier, out interface{}) error {
+// UnmarshalSignedAttribute decodes a signed attribute of the first signer into out. The attribute
+// must appear once with a single value. It returns ErrAttributeNotFound when it is absent.
+func (p7 *PKCS7) UnmarshalSignedAttribute(attributeType asn1.ObjectIdentifier, out any) error {
 	sd, ok := p7.raw.(signedData)
 	if !ok {
 		return errors.New("pkcs7: payload is not signedData content")
@@ -210,14 +303,20 @@ func (p7 *PKCS7) UnmarshalSignedAttribute(attributeType asn1.ObjectIdentifier, o
 	return unmarshalAttribute(attributes, attributeType, out)
 }
 
-func parseSignedData(data []byte) (*PKCS7, error) {
+// parseSignedData decodes the content of a SignedData ContentInfo.
+func parseSignedData(data []byte, opts ParseOptions) (*PKCS7, error) {
 	var sd signedData
-	asn1.Unmarshal(data, &sd)
-	certs, err := sd.Certificates.Parse()
+	rest, err := asn1.Unmarshal(data, &sd)
 	if err != nil {
 		return nil, err
 	}
-	// fmt.Printf("--> Signed Data Version %d\n", sd.Version)
+	if len(rest) > 0 {
+		return nil, asn1.SyntaxError{Msg: "trailing data after SignedData"}
+	}
+	certs, err := sd.Certificates.Parse(opts.LegacyCertificateParser)
+	if err != nil {
+		return nil, err
+	}
 
 	var compound asn1.RawValue
 	var content unsignedData
@@ -230,14 +329,9 @@ func parseSignedData(data []byte) (*PKCS7, error) {
 	}
 	// Compound octet string
 	if compound.IsCompound {
-		if compound.Tag == 4 {
-			for len(compound.Bytes) > 0 {
-				var cdata asn1.RawValue
-				if _, err = asn1.Unmarshal(compound.Bytes, &cdata); err != nil {
-					return nil, err
-				}
-				content = append(content, cdata.Bytes...)
-				compound.Bytes = compound.Bytes[len(cdata.FullBytes):]
+		if compound.Tag == asn1.TagOctetString {
+			if content, err = joinOctetStrings(compound.Bytes); err != nil {
+				return nil, err
 			}
 		} else {
 			content = compound.Bytes
@@ -254,27 +348,44 @@ func parseSignedData(data []byte) (*PKCS7, error) {
 		raw:          sd}, nil
 }
 
-// verifyCertChain takes an end-entity certs, a list of potential intermediates and a
-// truststore, and built all potential chains between the EE and a trusted root.
-//
-// When verifying chains that may have expired, currentTime can be set to a past date
-// to allow the verification to pass. If unset, currentTime is set to the current UTC time.
-func verifyCertChain(ee *x509.Certificate, certs []*x509.Certificate, truststore *x509.CertPool, currentTime time.Time) (chains [][]*x509.Certificate, err error) {
+// joinOctetStrings concatenates the primitive OCTET STRING segments of a constructed OCTET STRING.
+func joinOctetStrings(segments []byte) ([]byte, error) {
+	var out []byte
+	for len(segments) > 0 {
+		var segment asn1.RawValue
+		rest, err := asn1.Unmarshal(segments, &segment)
+		if err != nil {
+			return nil, err
+		}
+		if segment.Class != asn1.ClassUniversal || segment.Tag != asn1.TagOctetString || segment.IsCompound {
+			return nil, errors.New("pkcs7: constructed OCTET STRING holds an element that is not a primitive OCTET STRING")
+		}
+		out = append(out, segment.Bytes...)
+		segments = rest
+	}
+	return out, nil
+}
+
+// verifyCertChain builds a chain from ee to one of the roots, using certs as intermediates. A zero
+// currentTime means the current time. Empty keyUsages accept any extended key usage.
+func verifyCertChain(ee *x509.Certificate, certs []*x509.Certificate, roots *x509.CertPool, currentTime time.Time, keyUsages []x509.ExtKeyUsage) ([][]*x509.Certificate, error) {
 	intermediates := x509.NewCertPool()
 	for _, intermediate := range certs {
 		intermediates.AddCert(intermediate)
 	}
-	verifyOptions := x509.VerifyOptions{
-		Roots:         truststore,
+	if len(keyUsages) == 0 {
+		keyUsages = []x509.ExtKeyUsage{x509.ExtKeyUsageAny}
+	}
+	chains, err := ee.Verify(x509.VerifyOptions{
+		Roots:         roots,
 		Intermediates: intermediates,
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		KeyUsages:     keyUsages,
 		CurrentTime:   currentTime,
-	}
-	chains, err = ee.Verify(verifyOptions)
+	})
 	if err != nil {
-		return chains, fmt.Errorf("pkcs7: failed to verify certificate chain: %v", err)
+		return chains, fmt.Errorf("pkcs7: failed to verify certificate chain: %w", err)
 	}
-	return
+	return chains, nil
 }
 
 // MessageDigestMismatchError is returned when the signer data digest does not
@@ -284,71 +395,13 @@ type MessageDigestMismatchError struct {
 	ActualDigest   []byte
 }
 
+// Error implements error.
 func (err *MessageDigestMismatchError) Error() string {
-	return fmt.Sprintf("pkcs7: Message digest mismatch\n\tExpected: %X\n\tActual  : %X", err.ExpectedDigest, err.ActualDigest)
+	return fmt.Sprintf("pkcs7: Message digest mismatch\n\tExpected: %X\n\tActual  : %X",
+		err.ExpectedDigest, err.ActualDigest)
 }
 
-func getSignatureAlgorithm(digestEncryption, digest pkix.AlgorithmIdentifier) (x509.SignatureAlgorithm, error) {
-	switch {
-	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA1):
-		return x509.ECDSAWithSHA1, nil
-	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA256):
-		return x509.ECDSAWithSHA256, nil
-	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA384):
-		return x509.ECDSAWithSHA384, nil
-	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA512):
-		return x509.ECDSAWithSHA512, nil
-	case digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSA),
-		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA1),
-		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA256),
-		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA384),
-		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA512):
-		switch {
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA1), digest.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA1):
-			return x509.SHA1WithRSA, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA256), digest.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA256):
-			return x509.SHA256WithRSA, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA384), digest.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA384):
-			return x509.SHA384WithRSA, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA512), digest.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA512):
-			return x509.SHA512WithRSA, nil
-		default:
-			return -1, fmt.Errorf("pkcs7: unsupported digest %q for encryption algorithm %q",
-				digest.Algorithm.String(), digestEncryption.Algorithm.String())
-		}
-	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmDSA),
-		digestEncryption.Algorithm.Equal(OIDDigestAlgorithmDSASHA1):
-		switch {
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA1):
-			return x509.DSAWithSHA1, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA256):
-			return x509.DSAWithSHA256, nil
-		default:
-			return -1, fmt.Errorf("pkcs7: unsupported digest %q for encryption algorithm %q",
-				digest.Algorithm.String(), digestEncryption.Algorithm.String())
-		}
-	case digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmECDSAP256),
-		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmECDSAP384),
-		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmECDSAP521):
-		switch {
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA1):
-			return x509.ECDSAWithSHA1, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA256):
-			return x509.ECDSAWithSHA256, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA384):
-			return x509.ECDSAWithSHA384, nil
-		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA512):
-			return x509.ECDSAWithSHA512, nil
-		default:
-			return -1, fmt.Errorf("pkcs7: unsupported digest %q for encryption algorithm %q",
-				digest.Algorithm.String(), digestEncryption.Algorithm.String())
-		}
-	default:
-		return -1, fmt.Errorf("pkcs7: unsupported algorithm %q",
-			digestEncryption.Algorithm.String())
-	}
-}
-
+// getCertFromCertsByIssuerAndSerial returns the certificate with the issuer and serial number, or nil.
 func getCertFromCertsByIssuerAndSerial(certs []*x509.Certificate, ias issuerAndSerial) *x509.Certificate {
 	for _, cert := range certs {
 		if isCertMatchForIssuerAndSerial(cert, ias) {
@@ -358,28 +411,43 @@ func getCertFromCertsByIssuerAndSerial(certs []*x509.Certificate, ias issuerAndS
 	return nil
 }
 
-func unmarshalAttribute(attrs []attribute, attributeType asn1.ObjectIdentifier, out interface{}) error {
-	for _, attr := range attrs {
-		if attr.Type.Equal(attributeType) {
-			_, err := asn1.Unmarshal(attr.Value.Bytes, out)
-			return err
+// unmarshalAttribute decodes the single value of an attribute that must appear once in attrs.
+func unmarshalAttribute(attrs []attribute, attributeType asn1.ObjectIdentifier, out any) error {
+	var found *attribute
+	for i := range attrs {
+		if !attrs[i].Type.Equal(attributeType) {
+			continue
 		}
+		if found != nil {
+			return fmt.Errorf("pkcs7: attribute %v appears more than once", attributeType)
+		}
+		found = &attrs[i]
 	}
-	return errors.New("pkcs7: attribute type not in attributes")
+	if found == nil {
+		return ErrAttributeNotFound
+	}
+	if found.Value.Class != asn1.ClassUniversal || found.Value.Tag != asn1.TagSet {
+		return fmt.Errorf("pkcs7: attribute %v values are not a SET", attributeType)
+	}
+	rest, err := asn1.Unmarshal(found.Value.Bytes, out)
+	if err != nil {
+		return err
+	}
+	if len(rest) > 0 {
+		return fmt.Errorf("pkcs7: attribute %v has more than one value", attributeType)
+	}
+	return nil
 }
 
+// calculateHash hashes content with the custom hasher when one is set.
 func calculateHash(hasher Hasher, hashFunc crypto.Hash, content []byte) (computed []byte, err error) {
 	if hasher != nil {
-		computed, err = hasher.Hash(hashFunc, bytes.NewReader(content))
-	} else {
-		if !hashFunc.Available() {
-			return nil, fmt.Errorf("hash function %v not available", hashFunc)
-		}
-
-		h := hashFunc.New()
-		_, _ = h.Write(content)
-		computed = h.Sum(nil)
+		return hasher.Hash(hashFunc, bytes.NewReader(content))
 	}
-
-	return
+	if !hashFunc.Available() {
+		return nil, fmt.Errorf("hash function %v not available", hashFunc)
+	}
+	h := hashFunc.New()
+	_, _ = h.Write(content)
+	return h.Sum(nil), nil
 }

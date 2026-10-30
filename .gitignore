@@ -26,3 +26,7 @@ _testmain.go
 # Development
 .envrc
 coverage.out
+# Release artifacts, pinned tools and the release check export
+dist/
+bin/
+.cache/

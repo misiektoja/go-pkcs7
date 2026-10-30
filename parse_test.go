@@ -1,6 +1,3 @@
-//go:build !go1.23
-// +build !go1.23
-
 package pkcs7
 
 import (
@@ -17,8 +14,20 @@ func TestParseWindowsSCEPCertificateRequest(t *testing.T) {
 	}
 
 	p7, err := Parse(data)
+	if err == nil {
+		t.Errorf("expected error while parsing SCEP request data")
+	}
+	if err.Error() != "x509: authority key identifier incorrectly marked critical" {
+		t.Errorf(`expected "x509: authority key identifier incorrectly marked critical"; got "%s"`, err.Error())
+	}
+	if p7 != nil {
+		t.Errorf("expected p7 to be nil; got %v", p7)
+	}
+
+	// parse it again with the legacy certificate parser
+	p7, err = ParseWithOptions(data, ParseOptions{LegacyCertificateParser: true})
 	if err != nil {
-		t.Errorf("failed parsing SCEP request data: %v", err)
+		t.Errorf("failed parsing SCEP request data with legacy X509 certificate parser enabled: %v", err)
 	}
 
 	if len(p7.Certificates) != 1 {

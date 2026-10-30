@@ -1,233 +1,258 @@
 package pkcs7
 
 import (
-	"bytes"
 	"crypto"
-	"crypto/aes"
 	"crypto/cipher"
-	"crypto/des"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"math/big"
+	"slices"
 )
 
-// ErrUnsupportedAlgorithm tells you when our quick dev assumptions have failed
-var ErrUnsupportedAlgorithm = errors.New("pkcs7: cannot decrypt data: only RSA, DES, DES-EDE3, AES-256-CBC and AES-128-GCM supported")
+// ErrUnsupportedAlgorithm is returned when the content cipher of a message is not implemented.
+var ErrUnsupportedAlgorithm = errors.New(
+	"pkcs7: cannot decrypt data: only AES-CBC, DES-EDE3-CBC and DES-CBC are supported",
+)
 
-// ErrUnsupportedAsymmetricEncryptionAlgorithm is returned when attempting to use an unknown asymmetric encryption algorithm
-var ErrUnsupportedAsymmetricEncryptionAlgorithm = errors.New("pkcs7: cannot decrypt data: only RSA PKCS#1 v1.5 and RSA OAEP are supported")
+// ErrUnsupportedAsymmetricEncryptionAlgorithm is returned when a recipient uses an unknown key
+// encryption algorithm.
+var ErrUnsupportedAsymmetricEncryptionAlgorithm = errors.New(
+	"pkcs7: cannot decrypt data: only RSA PKCS#1 v1.5 and RSA OAEP are supported",
+)
 
 // ErrUnsupportedKeyType is returned when attempting to encrypting keys using a key that's not an RSA key
 var ErrUnsupportedKeyType = errors.New("pkcs7: only RSA keys are supported")
 
 // ErrNotEncryptedContent is returned when attempting to Decrypt data that is not encrypted data
-var ErrNotEncryptedContent = errors.New("pkcs7: content data is a decryptable data type")
+var ErrNotEncryptedContent = errors.New("pkcs7: content data is not an encrypted data type")
 
-// Decrypt decrypts encrypted content info for recipient cert and private key
-func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte, error) {
+// ErrContentEncryptionNotAllowed is returned when DecryptOptions do not accept the content cipher
+// of a message.
+var ErrContentEncryptionNotAllowed = errors.New("pkcs7: content encryption algorithm is not allowed")
+
+// ErrDecryptionFailed is returned when the content key or the content cannot be decrypted. It does
+// not say which step failed, so that a sender cannot use the error as a padding oracle.
+var ErrDecryptionFailed = errors.New("pkcs7: decryption failed")
+
+// DecryptOptions controls which algorithms Decrypt and DecryptUsingPSK accept.
+type DecryptOptions struct {
+	// ContentEncryptionAlgorithms lists the content ciphers to accept. When empty,
+	// DefaultContentDecryptionAlgorithms applies, which leaves out single DES.
+	ContentEncryptionAlgorithms []ContentEncryptionAlgorithm
+}
+
+// DefaultContentDecryptionAlgorithms are the content ciphers accepted when DecryptOptions lists none.
+var DefaultContentDecryptionAlgorithms = []ContentEncryptionAlgorithm{AES128CBC, AES192CBC, AES256CBC, DESEDE3CBC}
+
+// allows reports whether the options accept the content cipher.
+func (opts DecryptOptions) allows(alg ContentEncryptionAlgorithm) bool {
+	if len(opts.ContentEncryptionAlgorithms) == 0 {
+		return slices.Contains(DefaultContentDecryptionAlgorithms, alg)
+	}
+	return slices.Contains(opts.ContentEncryptionAlgorithms, alg)
+}
+
+// ContentEncryptionAlgorithm returns the content cipher of an EnvelopedData or EncryptedData
+// message. A responder can use it to answer with the cipher the requester chose.
+func (p7 *PKCS7) ContentEncryptionAlgorithm() (ContentEncryptionAlgorithm, error) {
+	var eci encryptedContentInfo
+	switch data := p7.raw.(type) {
+	case envelopedData:
+		eci = data.EncryptedContentInfo
+	case encryptedData:
+		eci = data.EncryptedContentInfo
+	default:
+		return 0, ErrNotEncryptedContent
+	}
+	alg, ok := contentEncryptionAlgorithmForOID(eci.ContentEncryptionAlgorithm.Algorithm)
+	if !ok {
+		return 0, ErrUnsupportedAlgorithm
+	}
+	return alg, nil
+}
+
+// Recipient identifies a recipient of an EnvelopedData message by the issuer name and serial
+// number of its certificate.
+type Recipient struct {
+	// Issuer is the DER encoded issuer name.
+	Issuer []byte
+	// SerialNumber is the certificate serial number.
+	SerialNumber *big.Int
+}
+
+// Recipients lists the recipients of an EnvelopedData message, so a receiver that holds several
+// keys can choose the one that decrypts it. They come in encoded order. DER sorts the recipient
+// set, so the order need not match the certificates given to Encrypt.
+func (p7 *PKCS7) Recipients() ([]Recipient, error) {
 	data, ok := p7.raw.(envelopedData)
 	if !ok {
 		return nil, ErrNotEncryptedContent
 	}
-	recipient := selectRecipientForCertificate(data.RecipientInfos, cert)
-	if recipient.EncryptedKey == nil {
+	recipients := make([]Recipient, 0, len(data.RecipientInfos))
+	for _, info := range data.RecipientInfos {
+		recipients = append(recipients, Recipient{
+			Issuer:       info.IssuerAndSerialNumber.IssuerName.FullBytes,
+			SerialNumber: info.IssuerAndSerialNumber.SerialNumber,
+		})
+	}
+	return recipients, nil
+}
+
+// Decrypt decrypts EnvelopedData content for the recipient certificate with its RSA private key.
+func (p7 *PKCS7) Decrypt(cert *x509.Certificate, key crypto.Decrypter, opts DecryptOptions) ([]byte, error) {
+	data, ok := p7.raw.(envelopedData)
+	if !ok {
+		return nil, ErrNotEncryptedContent
+	}
+	recipient, ok := selectRecipientForCertificate(data.RecipientInfos, cert)
+	if !ok {
 		return nil, errors.New("pkcs7: no enveloped recipient for provided certificate")
 	}
-	switch pkey := pkey.(type) {
-	case crypto.Decrypter:
-		var opts crypto.DecrypterOpts
-		switch algorithm := recipient.KeyEncryptionAlgorithm.Algorithm; {
-		case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
-			hashFunc, err := getHashFuncForKeyEncryptionAlgorithm(recipient.KeyEncryptionAlgorithm)
-			if err != nil {
-				return nil, err
-			}
-			opts = &rsa.OAEPOptions{Hash: hashFunc}
-		case algorithm.Equal(OIDEncryptionAlgorithmRSA):
-			opts = &rsa.PKCS1v15DecryptOptions{}
-		default:
-			return nil, ErrUnsupportedAsymmetricEncryptionAlgorithm
-		}
-		contentKey, err := pkey.Decrypt(rand.Reader, recipient.EncryptedKey, opts)
-		if err != nil {
+	c, err := data.EncryptedContentInfo.contentCipher(opts)
+	if err != nil {
+		return nil, err
+	}
+	var decrypterOpts crypto.DecrypterOpts
+	switch algorithm := recipient.KeyEncryptionAlgorithm.Algorithm; {
+	case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
+		if decrypterOpts, err = parseOAEPParameters(recipient.KeyEncryptionAlgorithm.Parameters); err != nil {
 			return nil, err
 		}
-		return data.EncryptedContentInfo.decrypt(contentKey)
-	}
-	return nil, ErrUnsupportedAlgorithm
-}
-
-// RFC 4055, 4.1
-// The current ASN.1 parser does not support non-integer defaults so the 'default:' tags here do nothing.
-type rsaOAEPAlgorithmParameters struct {
-	HashFunc    pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:0,default:sha1Identifier"`
-	MaskGenFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:1,default:mgf1SHA1Identifier"`
-	PSourceFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:2,default:pSpecifiedEmptyIdentifier"`
-}
-
-func getHashFuncForKeyEncryptionAlgorithm(keyEncryptionAlgorithm pkix.AlgorithmIdentifier) (crypto.Hash, error) {
-	invalidHashFunc := crypto.Hash(0)
-	params := &rsaOAEPAlgorithmParameters{
-		HashFunc: pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA1}, // set default hash algorithm to SHA1
-	}
-	var rest []byte
-	rest, err := asn1.Unmarshal(keyEncryptionAlgorithm.Parameters.FullBytes, params)
-	if err != nil {
-		return invalidHashFunc, fmt.Errorf("pkcs7: failed unmarshaling key encryption algorithm parameters: %v", err)
-	}
-	if len(rest) != 0 {
-		return invalidHashFunc, errors.New("pkcs7: trailing data after RSA OAEP parameters")
-	}
-
-	switch {
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA1):
-		return crypto.SHA1, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA224):
-		return crypto.SHA224, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA256):
-		return crypto.SHA256, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA384):
-		return crypto.SHA384, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA512):
-		return crypto.SHA512, nil
+	case algorithm.Equal(OIDEncryptionAlgorithmRSA):
+		// With SessionKeyLen set, bad padding yields a random key of the right length instead of an
+		// error. Content decryption then fails like it does for any wrong key, which defeats
+		// Bleichenbacher's attack (RFC 3218 section 2.3.2). SCEP and older CMS peers need PKCS #1 v1.5
+		// key transport, which Go has deprecated.
+		decrypterOpts = &rsa.PKCS1v15DecryptOptions{SessionKeyLen: c.keyLen} //nolint:staticcheck // See above.
 	default:
-		return invalidHashFunc, errors.New("pkcs7: unsupported hash function for RSA OAEP")
+		return nil, ErrUnsupportedAsymmetricEncryptionAlgorithm
 	}
+	contentKey, err := key.Decrypt(rand.Reader, recipient.EncryptedKey, decrypterOpts)
+	if err != nil || len(contentKey) != c.keyLen {
+		return nil, ErrDecryptionFailed
+	}
+	return data.EncryptedContentInfo.decrypt(c, contentKey)
 }
 
-// DecryptUsingPSK decrypts encrypted data using caller provided
-// pre-shared secret
-func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
+// parseOAEPParameters decodes RSAES-OAEP parameters into decryption options. Absent fields take
+// the SHA-1 defaults from RFC 8017.
+func parseOAEPParameters(params asn1.RawValue) (*rsa.OAEPOptions, error) {
+	var p rsaOAEPParameters
+	if len(params.FullBytes) > 0 && !slices.Equal(params.FullBytes, asn1.NullBytes) {
+		rest, err := asn1.Unmarshal(params.FullBytes, &p)
+		if err != nil {
+			return nil, fmt.Errorf("pkcs7: failed unmarshaling key encryption algorithm parameters: %w", err)
+		}
+		if len(rest) != 0 {
+			return nil, errors.New("pkcs7: trailing data after RSA OAEP parameters")
+		}
+	}
+	hash, mgfHash, err := parseHashAndMGF(p.Hash, p.MGF)
+	if err != nil {
+		return nil, err
+	}
+	var label []byte
+	if len(p.PSource.Algorithm) > 0 {
+		if !p.PSource.Algorithm.Equal(OIDOAEPSourcePSpecified) {
+			return nil, fmt.Errorf("pkcs7: unsupported RSA OAEP label source %v", p.PSource.Algorithm)
+		}
+		if _, err := asn1.Unmarshal(p.PSource.Parameters.FullBytes, &label); err != nil {
+			return nil, errors.New("pkcs7: malformed RSA OAEP label")
+		}
+	}
+	return &rsa.OAEPOptions{Hash: hash, MGFHash: mgfHash, Label: label}, nil
+}
+
+// DecryptUsingPSK decrypts EncryptedData content with a pre-shared key.
+func (p7 *PKCS7) DecryptUsingPSK(key []byte, opts DecryptOptions) ([]byte, error) {
 	data, ok := p7.raw.(encryptedData)
 	if !ok {
 		return nil, ErrNotEncryptedContent
 	}
-	return data.EncryptedContentInfo.decrypt(key)
-}
-
-func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
-	alg := eci.ContentEncryptionAlgorithm.Algorithm
-	if !alg.Equal(OIDEncryptionAlgorithmDESCBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES256CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES128CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES128GCM) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES256GCM) {
-		return nil, ErrUnsupportedAlgorithm
-	}
-
-	// EncryptedContent can either be constructed of multple OCTET STRINGs
-	// or _be_ a tagged OCTET STRING
-	var cyphertext []byte
-	if eci.EncryptedContent.IsCompound {
-		// Complex case to concat all of the children OCTET STRINGs
-		var buf bytes.Buffer
-		cypherbytes := eci.EncryptedContent.Bytes
-		for {
-			var part []byte
-			cypherbytes, _ = asn1.Unmarshal(cypherbytes, &part)
-			buf.Write(part)
-			if cypherbytes == nil {
-				break
-			}
-		}
-		cyphertext = buf.Bytes()
-	} else {
-		// Simple case, the bytes _are_ the cyphertext
-		cyphertext = eci.EncryptedContent.Bytes
-	}
-
-	var block cipher.Block
-	var err error
-
-	switch {
-	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
-		block, err = des.NewCipher(key)
-	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
-		block, err = des.NewTripleDESCipher(key)
-	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
-		fallthrough
-	case alg.Equal(OIDEncryptionAlgorithmAES128GCM), alg.Equal(OIDEncryptionAlgorithmAES128CBC):
-		block, err = aes.NewCipher(key)
-	}
-
+	c, err := data.EncryptedContentInfo.contentCipher(opts)
 	if err != nil {
 		return nil, err
 	}
-
-	if alg.Equal(OIDEncryptionAlgorithmAES128GCM) || alg.Equal(OIDEncryptionAlgorithmAES256GCM) {
-		params := aesGCMParameters{}
-		paramBytes := eci.ContentEncryptionAlgorithm.Parameters.Bytes
-
-		_, err := asn1.Unmarshal(paramBytes, &params)
-		if err != nil {
-			return nil, err
-		}
-
-		gcm, err := cipher.NewGCM(block)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(params.Nonce) != gcm.NonceSize() {
-			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
-		}
-		if params.ICVLen != gcm.Overhead() {
-			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
-		}
-
-		plaintext, err := gcm.Open(nil, params.Nonce, cyphertext, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		return plaintext, nil
+	if len(key) != c.keyLen {
+		return nil, fmt.Errorf("pkcs7: %s needs a %d-byte key, got %d bytes", c.name, c.keyLen, len(key))
 	}
-
-	iv := eci.ContentEncryptionAlgorithm.Parameters.Bytes
-	if len(iv) != block.BlockSize() {
-		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
-	}
-	mode := cipher.NewCBCDecrypter(block, iv)
-	plaintext := make([]byte, len(cyphertext))
-	mode.CryptBlocks(plaintext, cyphertext)
-	if plaintext, err = unpad(plaintext, mode.BlockSize()); err != nil {
-		return nil, err
-	}
-	return plaintext, nil
+	return data.EncryptedContentInfo.decrypt(c, key)
 }
 
-func unpad(data []byte, blocklen int) ([]byte, error) {
-	if blocklen < 1 {
-		return nil, fmt.Errorf("pkcs7: invalid blocklen %d", blocklen)
+// contentCipher returns the content cipher of the message when the options accept it.
+func (eci encryptedContentInfo) contentCipher(opts DecryptOptions) (contentCipher, error) {
+	alg, ok := contentEncryptionAlgorithmForOID(eci.ContentEncryptionAlgorithm.Algorithm)
+	if !ok {
+		return contentCipher{}, ErrUnsupportedAlgorithm
 	}
-	if len(data)%blocklen != 0 || len(data) == 0 {
-		return nil, fmt.Errorf("pkcs7: invalid data len %d", len(data))
+	if !opts.allows(alg) {
+		return contentCipher{}, fmt.Errorf("%w: %s", ErrContentEncryptionNotAllowed, alg)
 	}
+	return contentCiphers[alg], nil
+}
 
-	// the last byte is the length of padding
-	padlen := int(data[len(data)-1])
-
-	// check padding integrity, all bytes should be the same
-	pad := data[len(data)-padlen:]
-	for _, padbyte := range pad {
-		if padbyte != byte(padlen) {
-			return nil, errors.New("pkcs7: invalid padding")
+// decrypt decrypts the CBC content with the content key and removes its padding.
+func (eci encryptedContentInfo) decrypt(c contentCipher, key []byte) ([]byte, error) {
+	ciphertext := eci.EncryptedContent.Bytes
+	// The encrypted content is either one implicitly tagged OCTET STRING or, in BER, a
+	// constructed one made of segments.
+	if eci.EncryptedContent.IsCompound {
+		var err error
+		if ciphertext, err = joinOctetStrings(eci.EncryptedContent.Bytes); err != nil {
+			return nil, err
 		}
 	}
 
+	block, err := c.newBlock(key)
+	if err != nil {
+		return nil, ErrDecryptionFailed
+	}
+	params := eci.ContentEncryptionAlgorithm.Parameters
+	if params.Class != asn1.ClassUniversal || params.Tag != asn1.TagOctetString || params.IsCompound ||
+		len(params.Bytes) != block.BlockSize() {
+		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
+	}
+	if len(ciphertext) == 0 || len(ciphertext)%block.BlockSize() != 0 {
+		return nil, errors.New("pkcs7: ciphertext is not a whole number of cipher blocks")
+	}
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, params.Bytes).CryptBlocks(plaintext, ciphertext)
+	return unpad(plaintext, block.BlockSize())
+}
+
+// unpad removes PKCS #7 padding in constant time. Every padding failure returns ErrDecryptionFailed.
+func unpad(data []byte, blocklen int) ([]byte, error) {
+	if blocklen < 1 || blocklen > 255 {
+		return nil, fmt.Errorf("pkcs7: invalid blocklen %d", blocklen)
+	}
+	if len(data) == 0 || len(data)%blocklen != 0 {
+		return nil, ErrDecryptionFailed
+	}
+	padByte := data[len(data)-1]
+	padlen := int(padByte)
+	good := subtle.ConstantTimeLessOrEq(1, padlen) & subtle.ConstantTimeLessOrEq(padlen, blocklen)
+	// Every byte of the last block is inspected, so the time taken does not depend on padlen.
+	for i := 1; i <= blocklen; i++ {
+		inPadding := subtle.ConstantTimeLessOrEq(i, padlen)
+		good &= subtle.ConstantTimeSelect(inPadding, subtle.ConstantTimeByteEq(data[len(data)-i], padByte), 1)
+	}
+	if good != 1 {
+		return nil, ErrDecryptionFailed
+	}
 	return data[:len(data)-padlen], nil
 }
 
-func selectRecipientForCertificate(recipients []recipientInfo, cert *x509.Certificate) recipientInfo {
+// selectRecipientForCertificate returns the recipient info addressed to cert.
+func selectRecipientForCertificate(recipients []recipientInfo, cert *x509.Certificate) (recipientInfo, bool) {
 	for _, recp := range recipients {
 		if isCertMatchForIssuerAndSerial(cert, recp.IssuerAndSerialNumber) {
-			return recp
+			return recp, true
 		}
 	}
-	return recipientInfo{}
+	return recipientInfo{}, false
 }

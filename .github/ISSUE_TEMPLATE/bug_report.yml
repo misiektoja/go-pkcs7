@@ -1,0 +1,63 @@
+name: Bug report
+description: A message fails to parse, verify or decrypt, a peer rejects a message this library built, or behavior does not match the documentation or an RFC
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a suspected vulnerability here. Follow [SECURITY.md](https://github.com/misiektoja/go-pkcs7/blob/main/SECURITY.md) instead.
+
+        Never paste private keys, passwords or messages that carry real personal data into an issue. A sample message signed or encrypted with a throwaway key is the most useful reproduction.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead. Cite the RFC section when the library deviates from it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The calls and options you used, such as `VerifyOptions` or `EncryptOptions`, and a PEM sample message made with a throwaway key.
+      render: go
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error
+      description: The error the library returned, or the error the peer reported.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: go-pkcs7 version
+      placeholder: v0.3.0 or commit
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Go version and peer
+      description: The software that produced or consumed the message and its version, such as OpenSSL, a SCEP client or a CA product.
+      placeholder: go1.27.3, OpenSSL 3.5.4
+    validations:
+      required: true
+
+  - type: input
+    id: algorithms
+    attributes:
+      label: Algorithms
+      description: The key type, digest, signature and content encryption algorithms involved.
+      placeholder: RSA 2048, SHA-256, RSASSA-PSS, AES-128-CBC with RSAES-OAEP
+    validations:
+      required: false
