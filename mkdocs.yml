@@ -37,19 +37,38 @@ validation:
 
 markdown_extensions:
   - admonition
-  # The pages include sections of the README, so the two cannot drift.
+  # Code listings are included from example_test.go, where each one runs as a Go example, so the
+  # pages and the code cannot drift.
   - pymdownx.snippets:
       base_path: [.]
       check_paths: true
+      dedent_subsections: true
   - toc:
       permalink: true
   - pymdownx.superfences
 
 nav:
   - Overview: index.md
-  - Install: install.md
   - Getting started: getting-started.md
+  - Support matrix: support-matrix.md
   - Guides:
-      - Supported content types: guide/content-types.md
-      - Security defaults: guide/security-defaults.md
-  - Limitations: limitations.md
+      - Signing: guide/signing.md
+      - Verification: guide/verification.md
+      - Encryption and decryption: guide/encryption.md
+      - Pre-shared keys: guide/pre-shared-keys.md
+      - Parsing: guide/parsing.md
+  - Reference:
+      - Options: reference/options.md
+      - Algorithms: reference/algorithms.md
+      - Errors: reference/errors.md
+      - Compatibility policy: reference/compatibility.md
+  - Interoperability:
+      - OpenSSL: interoperability/openssl.md
+  - Security:
+      - Security model: security/security-model.md
+  - Migrating from smallstep/pkcs7: migrating.md
+  - Development:
+      - Development: development/development.md
+      - Testing: development/testing.md
+      - Release process: development/release-process.md
+  - Known limitations: known-limitations.md

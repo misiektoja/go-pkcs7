@@ -1,16 +1,40 @@
 # go-pkcs7
 
---8<-- "README.md:intro"
+go-pkcs7 is a Go library that parses and builds the parts of the Cryptographic Message Syntax
+(CMS, RFC 5652) that certificate enrollment protocols use. SCEP (RFC 8894) wraps every request and
+response in these messages. [go-pki-scep](https://misiektoja.github.io/go-pki-scep/) is built on
+this library.
+
+It handles three content types:
+
+* **SignedData**: signing with RSA PKCS #1 v1.5 or ECDSA keys and verification of RSA PKCS #1
+  v1.5, RSASSA-PSS (RFC 4055) and ECDSA signatures. Content may be attached or detached and a
+  message may have several signers or carry only certificates or a CRL.
+* **EnvelopedData**: content encrypted for RSA recipient certificates with PKCS #1 v1.5 or
+  RSAES-OAEP (RFC 8017) key transport.
+* **EncryptedData**: content encrypted with a pre-shared key.
+
+Algorithm choices are made per call through option structs, so two parts of one program can apply
+different policies. Signing keys are `crypto.Signer` and decryption keys `crypto.Decrypter`
+values, so they may live in an HSM. Input may be BER or DER. The module needs Go 1.27.3 or newer
+and has no dependencies outside the standard library.
 
 ## Where to go next
 
 | I want to | Page |
 | --- | --- |
-| Add the module to a Go project | [Install](install.md) |
-| Sign, verify, encrypt or decrypt a message | [Getting started](getting-started.md) |
-| See which CMS content types, digests and ciphers are supported | [Supported content types](guide/content-types.md) |
-| Know what the library checks and refuses by default | [Security defaults](guide/security-defaults.md) |
-| Check what is not supported | [Limitations](limitations.md) |
+| Add the module and sign, verify and encrypt a first message | [Getting started](getting-started.md) |
+| See which algorithms and message forms are supported | [Support matrix](support-matrix.md) |
+| Sign content, add a certificate chain or build a certificate bundle | [Signing](guide/signing.md) |
+| Verify a signature against trust anchors or at the signing time | [Verification](guide/verification.md) |
+| Encrypt for recipient certificates or decrypt with an HSM key | [Encryption and decryption](guide/encryption.md) |
+| Encrypt with a key both sides already hold | [Pre-shared keys](guide/pre-shared-keys.md) |
+| Read messages from other implementations | [Parsing](guide/parsing.md) |
+| Look up an option, an algorithm identifier or an error | [Options](reference/options.md), [Algorithms](reference/algorithms.md) and [Errors](reference/errors.md) |
+| Know what the library checks and what it leaves to the caller | [Security model](security/security-model.md) |
+| Exchange messages with OpenSSL | [OpenSSL](interoperability/openssl.md) |
+| Move code from smallstep/pkcs7 | [Migrating from smallstep/pkcs7](migrating.md) |
+| Check what is not supported | [Known limitations](known-limitations.md) |
 | Look up a type or function | [Package documentation](https://pkg.go.dev/github.com/misiektoja/go-pkcs7) |
 | See what changed in a release | [Changelog](https://github.com/misiektoja/go-pkcs7/blob/main/CHANGELOG.md) |
 | Ask for help or report a problem | [Support](https://github.com/misiektoja/go-pkcs7/blob/main/SUPPORT.md) |
@@ -19,7 +43,17 @@
 
 ## Credits
 
---8<-- "README.md:credits"
+go-pkcs7 continues the work of these projects and their contributors:
+
+* [fullsailor/pkcs7](https://github.com/fullsailor/pkcs7), the original implementation by Andrew
+  Smith.
+* [mozilla-services/pkcs7](https://github.com/mozilla-services/pkcs7), the Mozilla fork.
+* [smallstep/pkcs7](https://github.com/smallstep/pkcs7), the Smallstep fork this repository
+  started from.
+
+All three are MIT licensed. [NOTICE](https://github.com/misiektoja/go-pkcs7/blob/main/NOTICE)
+records the origins of the code, including the copies of Go 1.23 `crypto/x509` and
+`golang.org/x/crypto/cryptobyte` under `internal/`.
 
 ## Related projects
 
