@@ -19,6 +19,8 @@ through option structs, so two parts of one program can apply different policies
 configured through package variables.
 <!-- --8<-- [end:intro] -->
 
+The documentation is at [misiektoja.github.io/go-pkcs7](https://misiektoja.github.io/go-pkcs7/).
+
 ## Contents
 
 * [Install](#install)
@@ -137,8 +139,10 @@ The defaults suit current peers. Each relaxation is an option on the call that n
 
 ## Documentation
 
-The package documentation on [pkg.go.dev](https://pkg.go.dev/github.com/misiektoja/go-pkcs7)
-describes every exported type and option. Repository files:
+The documentation site at [misiektoja.github.io/go-pkcs7](https://misiektoja.github.io/go-pkcs7/)
+covers the scope, getting started, the security defaults and the limitations. The package
+documentation on [pkg.go.dev](https://pkg.go.dev/github.com/misiektoja/go-pkcs7) describes every
+exported type and option. Repository files:
 
 * [SUPPORT.md](SUPPORT.md) explains where to ask and what to include.
 * [CONTRIBUTING.md](CONTRIBUTING.md) lists the development checks.
