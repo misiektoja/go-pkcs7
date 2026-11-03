@@ -30,3 +30,6 @@ coverage.out
 dist/
 bin/
 .cache/
+
+# Documentation site build output
+site/
