@@ -7,6 +7,7 @@
 [![Supply chain](https://github.com/misiektoja/go-pkcs7/actions/workflows/supply-chain.yml/badge.svg?branch=main)](https://github.com/misiektoja/go-pkcs7/actions/workflows/supply-chain.yml)
 [![OpenSSF Scorecard](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.scorecard.dev%2Fprojects%2Fgithub.com%2Fmisiektoja%2Fgo-pkcs7&query=%24.score&label=openssf%20scorecard&style=flat-square)](https://scorecard.dev/viewer/?uri=github.com/misiektoja/go-pkcs7)
 
+<!-- --8<-- [start:intro] -->
 go-pkcs7 is a Go library that parses and builds the parts of the Cryptographic Message Syntax
 (CMS, RFC 5652) that certificate enrollment protocols use. SCEP (RFC 8894) wraps every request and
 response in these messages. [go-pki-scep](https://github.com/misiektoja/go-pki-scep) is built on
@@ -16,6 +17,7 @@ It signs and verifies SignedData, encrypts and decrypts EnvelopedData for RSA re
 encrypts and decrypts EncryptedData with a pre-shared key. Algorithm choices are made per call
 through option structs, so two parts of one program can apply different policies. Nothing is
 configured through package variables.
+<!-- --8<-- [end:intro] -->
 
 ## Contents
 
@@ -31,16 +33,19 @@ configured through package variables.
 
 ## Install
 
+<!-- --8<-- [start:install] -->
 ```bash
 go get github.com/misiektoja/go-pkcs7
 ```
 
 The module needs Go 1.27.3 or newer and has no dependencies outside the standard library. The
 package is imported as `pkcs7`. The API may still change before v1.0.0, as
-[CHANGELOG.md](CHANGELOG.md) records.
+[CHANGELOG.md](https://github.com/misiektoja/go-pkcs7/blob/main/CHANGELOG.md) records.
+<!-- --8<-- [end:install] -->
 
 ## Scope
 
+<!-- --8<-- [start:scope] -->
 | Content type | Coverage |
 | --- | --- |
 | SignedData (RFC 5652 section 5) | Signing with RSA PKCS #1 v1.5 or ECDSA keys through `crypto.Signer`. Verification of RSA PKCS #1 v1.5, RSASSA-PSS (RFC 4055) and ECDSA signatures. Attached and detached content, several signers and messages that carry only certificates or a CRL |
@@ -54,9 +59,11 @@ indefinite lengths, and is converted to DER before parsing.
 The tests check the library against OpenSSL whenever `openssl` is on the `PATH`. OpenSSL reads the
 signed messages and decrypts the enveloped messages this library builds. This library verifies
 OpenSSL signatures, including RSASSA-PSS, and decrypts OpenSSL RSAES-OAEP messages.
+<!-- --8<-- [end:scope] -->
 
 ## Getting started
 
+<!-- --8<-- [start:getting-started] -->
 Sign content with a certificate and its key, then verify the result against a trust anchor:
 
 ```go
@@ -102,9 +109,11 @@ plaintext, err := p7.Decrypt(recipient, recipientKey, pkcs7.DecryptOptions{})
 ```
 
 `ExampleSignedData` in the package documentation builds a detached signature.
+<!-- --8<-- [end:getting-started] -->
 
 ## Security defaults
 
+<!-- --8<-- [start:security-defaults] -->
 The defaults suit current peers. Each relaxation is an option on the call that needs it.
 
 * **Signing** uses SHA-256 unless `SetDigestAlgorithm` names another digest.
@@ -124,6 +133,7 @@ The defaults suit current peers. Each relaxation is an option on the call that n
 * **Embedded certificates** are parsed by `crypto/x509`. `ParseOptions.LegacyCertificateParser`
   also accepts certificates that mark the authority key identifier critical, which some Windows
   SCEP clients send.
+<!-- --8<-- [end:security-defaults] -->
 
 ## Documentation
 
@@ -138,15 +148,18 @@ describes every exported type and option. Repository files:
 
 ## Limitations
 
+<!-- --8<-- [start:limitations] -->
 * No AuthEnvelopedData (RFC 5083) and no AES-GCM content encryption.
 * No key agreement or key encryption key recipients. EnvelopedData recipients are RSA certificates.
 * No signing with RSASSA-PSS or Ed25519 and no verification of Ed25519 or DSA signatures.
 * No countersignatures, signed receipts or other CMS content types such as DigestedData and
   AuthenticatedData.
 * No streaming. Messages are held in memory while they are parsed or built.
+<!-- --8<-- [end:limitations] -->
 
 ## Credits
 
+<!-- --8<-- [start:credits] -->
 go-pkcs7 continues the work of these projects and their contributors:
 
 * [fullsailor/pkcs7](https://github.com/fullsailor/pkcs7), the original implementation by Andrew
@@ -155,8 +168,9 @@ go-pkcs7 continues the work of these projects and their contributors:
 * [smallstep/pkcs7](https://github.com/smallstep/pkcs7), the Smallstep fork this repository
   started from.
 
-All three are MIT licensed. [NOTICE](NOTICE) records the origins of the code, including the Go
-standard library code copied under `internal/`.
+All three are MIT licensed. [NOTICE](https://github.com/misiektoja/go-pkcs7/blob/main/NOTICE)
+records the origins of the code, including the Go standard library code copied under `internal/`.
+<!-- --8<-- [end:credits] -->
 
 ## Support
 
