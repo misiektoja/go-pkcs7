@@ -704,10 +704,19 @@ ZARKjbu1TuYQHf0fs+GwID8zeLc2zJL7UzcHFwwQ6Nda9OJN4uPAuC/BKaIpxCLL
 wNuvFqc=
 -----END CERTIFICATE-----`)
 
+// requireOpenSSL skips the test when the openssl command is not on the PATH.
+func requireOpenSSL(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not found")
+	}
+}
+
 // sign a document with openssl and verify the signature with pkcs7.
 // this uses a chain of root, intermediate and signer cert, where the
 // intermediate is added to the certs but the root isn't.
 func TestSignWithOpenSSLAndVerify(t *testing.T) {
+	requireOpenSSL(t)
 	content := []byte(`
 A ship in port is safe,
 but that's not what ships are built for.
