@@ -3,9 +3,11 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"os"
@@ -263,6 +265,143 @@ func TestEncryptAndDecryptWithOpenSSL(t *testing.T) {
 			}
 			if !bytes.Equal(content, out) {
 				t.Errorf("openssl decrypted %q, want %q", out, content)
+			}
+		})
+	}
+}
+
+// TestDecryptOpenSSLOAEPParameters checks RSAES-OAEP recipients whose MGF1 hash differs from the
+// OAEP hash and that carry a label, as openssl cms writes them.
+func TestDecryptOpenSSLOAEPParameters(t *testing.T) {
+	t.Parallel()
+	requireOpenSSL(t)
+	tf := UnmarshalTestFixture(RSAOAEPSHA256EncryptedTestFixture)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "recipient.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tf.Certificate.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("this is the content")
+	contentFile := filepath.Join(dir, "content.txt")
+	if err := os.WriteFile(contentFile, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		oaepMD  string
+		mgf1MD  string
+		hasMGF1 bool
+	}{
+		// SHA-1 is the MGF1 default, so OpenSSL leaves the MGF1 parameters out.
+		{name: "SHA256/MGF1-SHA1", oaepMD: "sha256", mgf1MD: "sha1"},
+		{name: "SHA256/MGF1-SHA512", oaepMD: "sha256", mgf1MD: "sha512", hasMGF1: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			encryptedFile := filepath.Join(t.TempDir(), "encrypted.der")
+			out, err := exec.CommandContext(t.Context(), "openssl", "cms", "-encrypt", "-binary", "-aes128",
+				"-in", contentFile, "-outform", "DER", "-out", encryptedFile, "-recip", certFile,
+				"-keyopt", "rsa_padding_mode:oaep",
+				"-keyopt", "rsa_oaep_md:"+tt.oaepMD,
+				"-keyopt", "rsa_mgf1_md:"+tt.mgf1MD,
+				"-keyopt", "rsa_oaep_label:0102030405",
+			).CombinedOutput()
+			if err != nil {
+				t.Fatalf("openssl command failed with %s: %s", err, out)
+			}
+			der, err := os.ReadFile(encryptedFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p7, err := Parse(der)
+			if err != nil {
+				t.Fatal(err)
+			}
+			params := p7.raw.(envelopedData).RecipientInfos[0].KeyEncryptionAlgorithm.Parameters.FullBytes
+			var p rsaOAEPParameters
+			if _, err := asn1.Unmarshal(params, &p); err != nil {
+				t.Fatal(err)
+			}
+			if len(p.PSource.Algorithm) == 0 {
+				t.Fatal("openssl wrote no OAEP label")
+			}
+			if got := len(p.MGF.Algorithm) != 0; got != tt.hasMGF1 {
+				t.Fatalf("MGF1 parameters present = %v, want %v", got, tt.hasMGF1)
+			}
+			got, err := p7.Decrypt(tf.Certificate, tf.PrivateKey, DecryptOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, content) {
+				t.Errorf("decrypted %q, want %q", got, content)
+			}
+		})
+	}
+}
+
+// TestEncryptUsingPSKWithOpenSSL checks EncryptedData in both directions against openssl cms
+// -EncryptedData_encrypt and -EncryptedData_decrypt.
+func TestEncryptUsingPSKWithOpenSSL(t *testing.T) {
+	t.Parallel()
+	requireOpenSSL(t)
+	for _, tt := range []struct {
+		alg  ContentEncryptionAlgorithm
+		flag string
+	}{
+		{AES128CBC, "-aes128"},
+		{AES192CBC, "-aes192"},
+		{AES256CBC, "-aes256"},
+		{DESEDE3CBC, "-des3"},
+	} {
+		t.Run(tt.alg.String(), func(t *testing.T) {
+			key := make([]byte, contentCiphers[tt.alg].keyLen)
+			if _, err := rand.Read(key); err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("this is the content")
+			dir := t.TempDir()
+			contentFile := filepath.Join(dir, "content.txt")
+			if err := os.WriteFile(contentFile, content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			encrypted, err := EncryptUsingPSK(content, key, EncryptOptions{ContentEncryption: tt.alg})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encryptedFile := filepath.Join(dir, "library.der")
+			if err := os.WriteFile(encryptedFile, encrypted, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(t.Context(), "openssl", "cms", "-EncryptedData_decrypt", "-inform", "DER", "-in", encryptedFile, "-secretkey", hex.EncodeToString(key))
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("openssl cms -EncryptedData_decrypt failed with %s: %s", err, stderr.Bytes())
+			}
+			if !bytes.Equal(out, content) {
+				t.Errorf("openssl decrypted %q, want %q", out, content)
+			}
+
+			opensslFile := filepath.Join(dir, "openssl.der")
+			if out, err := exec.CommandContext(t.Context(), "openssl", "cms", "-EncryptedData_encrypt", "-binary", "-in", contentFile, "-outform", "DER", "-out", opensslFile, tt.flag, "-secretkey", hex.EncodeToString(key)).CombinedOutput(); err != nil {
+				t.Fatalf("openssl cms -EncryptedData_encrypt failed with %s: %s", err, out)
+			}
+			der, err := os.ReadFile(opensslFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p7, err := Parse(der)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plaintext, err := p7.DecryptUsingPSK(key, DecryptOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(plaintext, content) {
+				t.Errorf("DecryptUsingPSK returned %q, want %q", plaintext, content)
 			}
 		})
 	}

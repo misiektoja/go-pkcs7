@@ -431,3 +431,71 @@ func TestRemoveCertificates(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestOpenSSLVerifiesSignedData checks that openssl cms -verify accepts attached, detached and
+// attribute-free signatures from RSA and ECDSA signers.
+func TestOpenSSLVerifiesSignedData(t *testing.T) {
+	t.Parallel()
+	requireOpenSSL(t)
+	for _, keyAlg := range []x509.SignatureAlgorithm{x509.SHA256WithRSA, x509.ECDSAWithSHA256} {
+		root, err := createTestCertificateByIssuer("PKCS7 Test Root CA", nil, keyAlg, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signer, err := createTestCertificateByIssuer("PKCS7 Test Signer", root, keyAlg, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		rootFile := filepath.Join(dir, "root.pem")
+		if err := os.WriteFile(rootFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Certificate.Raw}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		contentFile := filepath.Join(dir, "content.txt")
+		content := []byte("line one\nline two\n")
+		if err := os.WriteFile(contentFile, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, mode := range []string{"attached", "detached", "without-attributes"} {
+			t.Run(keyAlg.String()+"/"+mode, func(t *testing.T) {
+				sd, err := NewSignedData(content)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "without-attributes" {
+					err = sd.SignWithoutAttr(signer.Certificate, signer.PrivateKey, SignerInfoConfig{})
+				} else {
+					err = sd.AddSigner(signer.Certificate, signer.PrivateKey, SignerInfoConfig{})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "detached" {
+					sd.Detach()
+				}
+				der, err := sd.Finish()
+				if err != nil {
+					t.Fatal(err)
+				}
+				signatureFile := filepath.Join(t.TempDir(), "signature.der")
+				if err := os.WriteFile(signatureFile, der, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				args := []string{"cms", "-verify", "-binary", "-inform", "DER", "-in", signatureFile, "-CAfile", rootFile}
+				if mode == "detached" {
+					args = append(args, "-content", contentFile)
+				}
+				cmd := exec.CommandContext(t.Context(), "openssl", args...)
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				out, err := cmd.Output()
+				if err != nil {
+					t.Fatalf("openssl cms -verify failed with %s: %s", err, stderr.Bytes())
+				}
+				if !bytes.Equal(out, content) {
+					t.Errorf("openssl returned %q, want %q", out, content)
+				}
+			})
+		}
+	}
+}
