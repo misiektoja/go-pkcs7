@@ -1,8 +1,7 @@
 # Getting help
 
-Start with the [documentation site](https://misiektoja.github.io/go-pkcs7/) or the
-[README](README.md), which cover the supported content types, the algorithms and the security
-defaults. The package documentation on
+Start with the [documentation site](https://misiektoja.github.io/go-pkcs7/), which covers the
+supported algorithms, the options, the errors and the security model. The package documentation on
 [pkg.go.dev](https://pkg.go.dev/github.com/misiektoja/go-pkcs7) describes every exported type.
 
 ## Check your setup first

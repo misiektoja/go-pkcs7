@@ -22,18 +22,18 @@ make test
 
 `make fmt-check` fails when a tracked Go file is not gofmt formatted. `make lint` runs golangci-lint at the version CI uses, installed under `bin/`. `make test` runs `go vet` and the tests under the race detector. The OpenSSL interoperability tests skip when `openssl` is not on the `PATH`, and `TESTFLAGS=-v` lists them. `make fuzz` runs each fuzz target for 30 seconds, or for `FUZZTIME`. Run `make tidy-check` when `go.mod` changes, `make govulncheck` when a dependency changes and `make actionlint` when a workflow changes. `make gitleaks` scans the working tree and the commit history for credentials. `make help` lists every target.
 
-Format changes need negative tests and an RFC citation. A parser change also needs a fuzz run, and a crash the fuzzer finds stays in `testdata/fuzz` as a regression input. Interoperability claims need evidence naming the peer and its version. User-facing behavior changes update the Go doc comments, the README and [CHANGELOG.md](CHANGELOG.md).
+Format changes need negative tests and an RFC citation. A parser change also needs a fuzz run. A crash the fuzzer finds stays in `testdata/fuzz` as a regression input. Interoperability claims need evidence naming the peer and its version. User-facing behavior changes update the Go doc comments, the documentation site and [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation site
 
-The site at [misiektoja.github.io/go-pkcs7](https://misiektoja.github.io/go-pkcs7/) is built with MkDocs and the Material theme from `docs/` and `mkdocs.yml`. Its pages include the README sections between the `--8<--` markers, so edit those sections in the README. Set `PYTHON` when the MkDocs toolchain lives in a virtual environment:
+The site at [misiektoja.github.io/go-pkcs7](https://misiektoja.github.io/go-pkcs7/) is built with MkDocs and the Material theme from `docs/` and `mkdocs.yml`. The Go listings on its pages are sections of `example_test.go`, so they compile and run with `make test`. Edit the example to change a listing. Set `PYTHON` when the MkDocs toolchain lives in a virtual environment:
 
 ```bash
 make docs-deps PYTHON=.venv/bin/python
 make docs-serve PYTHON=.venv/bin/python
 ```
 
-`make docs-build` runs with `--strict`, so a broken link, a missing anchor or a page absent from the navigation fails the build. Links in the included README sections must be absolute, because a relative link such as `CHANGELOG.md` does not resolve on the site. The [documentation workflow](.github/workflows/docs.yml) runs the same build on every change to the documentation and publishes the site from `main` to the `gh-pages` branch.
+`make docs-build` runs with `--strict`, so a broken link, a missing anchor or a page absent from the navigation fails the build. Pages link to repository files outside `docs/` with absolute GitHub URLs, because a relative link does not resolve on the site. The [documentation workflow](.github/workflows/docs.yml) runs the same build on every change to the documentation and publishes the site from `main` to the `gh-pages` branch.
 
 The toolchain is pinned with hashes in `docs/requirements.txt`, which `make docs-deps` installs in hash-checking mode. The direct dependencies live in `docs/requirements.in`. To change a version, edit that file and run `make docs-requirements`, which needs pip-tools in the `PYTHON` environment.
 
