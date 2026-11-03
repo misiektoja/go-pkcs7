@@ -3,6 +3,9 @@ contact_links:
   - name: Report a vulnerability
     url: https://github.com/misiektoja/go-pkcs7/security/advisories/new
     about: Report privately through GitHub. Never open a public issue for a suspected vulnerability.
+  - name: Documentation
+    url: https://misiektoja.github.io/go-pkcs7/
+    about: Install, getting started, the supported content types, the security defaults and the limitations.
   - name: Package documentation
     url: https://pkg.go.dev/github.com/misiektoja/go-pkcs7
     about: Every exported type and the options for signing, verification, encryption and decryption.
