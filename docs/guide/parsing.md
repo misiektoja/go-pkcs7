@@ -1,3 +1,7 @@
+---
+description: "Parse BER and DER CMS ContentInfo messages in Go with go-pkcs7, including what Parse fills in and how certificates and CRLs are read."
+---
+
 # Parsing
 
 `Parse` decodes one CMS ContentInfo into a `*PKCS7`. It reads the structure only. Signatures,

@@ -1,3 +1,7 @@
+---
+description: "Encrypt and decrypt CMS EncryptedData in Go with go-pkcs7 using a pre-shared symmetric key that both sides already hold."
+---
+
 # Pre-shared keys
 
 An EncryptedData message carries content encrypted with a symmetric key that both sides already

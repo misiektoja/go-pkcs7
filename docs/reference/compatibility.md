@@ -1,3 +1,7 @@
+---
+description: "Compatibility policy of go-pkcs7: semantic versioning before and after v1.0.0, upgrade rules, the supported Go version and module path."
+---
+
 # Compatibility policy
 
 The module uses semantic versioning. The public API is every exported identifier of the package

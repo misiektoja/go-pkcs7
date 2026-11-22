@@ -1,3 +1,7 @@
+---
+description: "Algorithms in go-pkcs7: content ciphers, RSA key transport, digests, signature algorithms such as RSASSA-PSS and the supported OIDs."
+---
+
 # Algorithms
 
 ## Content ciphers

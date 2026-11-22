@@ -1,3 +1,8 @@
+---
+title: "PKCS #7 and CMS library for Go (RFC 5652)"
+description: "go-pkcs7 is a Go library that parses and builds PKCS #7 and CMS (RFC 5652) signed and encrypted messages for SCEP and other enrollment protocols."
+---
+
 # go-pkcs7
 
 go-pkcs7 is a Go library that parses and builds the parts of the Cryptographic Message Syntax

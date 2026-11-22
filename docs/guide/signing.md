@@ -1,3 +1,7 @@
+---
+description: "Create CMS SignedData in Go with go-pkcs7: signer keys, digest and signature algorithms, attributes, detached signatures and certificate bundles."
+---
+
 # Signing
 
 A SignedData message carries content, one or more signatures over it and usually the certificates

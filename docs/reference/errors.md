@@ -1,3 +1,7 @@
+---
+description: "Errors returned by go-pkcs7: sentinel errors, error types and other errors, plus how to match them with errors.Is and errors.As."
+---
+
 # Errors
 
 Compare errors with `errors.Is` and `errors.As`, not by their text. Some sentinel errors are

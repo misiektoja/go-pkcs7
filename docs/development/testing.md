@@ -1,3 +1,7 @@
+---
+description: "Test go-pkcs7 with unit tests, examples, recorded messages from other software, OpenSSL interoperability, fuzzing and CI."
+---
+
 # Testing
 
 The library is tested with unit tests, examples, recorded messages from other software, OpenSSL and

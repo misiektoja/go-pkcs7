@@ -1,3 +1,7 @@
+---
+description: "Encrypt and decrypt CMS EnvelopedData in Go with go-pkcs7 for RSA recipients, including algorithm choice, several keys and HSM keys."
+---
+
 # Encryption and decryption
 
 An EnvelopedData message carries content encrypted with a random content key and that key

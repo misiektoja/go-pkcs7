@@ -1,3 +1,7 @@
+---
+description: "How go-pkcs7 interoperates with the OpenSSL cms command: messages each side creates and reads, line endings and unsupported OpenSSL output."
+---
+
 # OpenSSL
 
 The tests exchange messages with the `openssl` command found on the `PATH`. They skip when it is

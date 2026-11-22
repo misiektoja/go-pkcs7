@@ -1,3 +1,7 @@
+---
+description: "Security model of go-pkcs7: what a successful Verify guarantees, what the caller decides, decryption failures and handling of hostile input."
+---
+
 # Security model
 
 This page states what the library guarantees, what it leaves to the caller and how it treats

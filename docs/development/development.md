@@ -1,3 +1,7 @@
+---
+description: "Build, check and change go-pkcs7: Go prerequisites, repository layout, make commands, documentation builds and code style."
+---
+
 # Development
 
 How to build, check and change the library. Contribution rules are in

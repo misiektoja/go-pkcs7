@@ -1,3 +1,7 @@
+---
+description: "Support matrix for go-pkcs7: supported CMS content types, signature algorithms, key transport, content ciphers, encodings and platforms."
+---
+
 # Support matrix
 
 ## Content types

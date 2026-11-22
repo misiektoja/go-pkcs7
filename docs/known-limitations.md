@@ -1,3 +1,7 @@
+---
+description: "Known limitations of go-pkcs7: no AuthEnvelopedData or AES-GCM, unsupported content types, signature and encryption gaps and processing limits."
+---
+
 # Known limitations
 
 ## Content types

@@ -1,3 +1,7 @@
+---
+description: "Migrate from smallstep/pkcs7 to go-pkcs7: the new module path, API changes, changed defaults, stricter checks and removed features."
+---
+
 # Migrating from smallstep/pkcs7
 
 go-pkcs7 started from [smallstep/pkcs7](https://github.com/smallstep/pkcs7) v0.2.3. The package

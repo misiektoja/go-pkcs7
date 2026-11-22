@@ -1,3 +1,7 @@
+---
+description: "Add go-pkcs7 to a Go project, then sign and verify a PKCS #7 message and encrypt and decrypt content for a recipient certificate."
+---
+
 # Getting started
 
 This page adds the module to a project, signs and verifies a message and encrypts content for a

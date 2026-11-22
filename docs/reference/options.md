@@ -1,3 +1,7 @@
+---
+description: "Reference for go-pkcs7 option structs: SignerInfoConfig, VerifyOptions, EncryptOptions, DecryptOptions and ParseOptions with their defaults."
+---
+
 # Options
 
 Every algorithm choice and every relaxation is made per call through these structs. Their zero

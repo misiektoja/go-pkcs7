@@ -1,3 +1,7 @@
+---
+description: "Verify CMS SignedData signatures in Go with go-pkcs7: trust anchors, check time, detached content, signer certificates and custom hashing."
+---
+
 # Verification
 
 `Verify` checks the signers of a parsed SignedData message. Parsing alone checks nothing, so call

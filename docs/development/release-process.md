@@ -1,3 +1,7 @@
+---
+description: "How a go-pkcs7 release is made: semantic versioning, pushing a version tag, the changelog section, release artifacts and documentation."
+---
+
 # Release process
 
 A release starts when a version tag reachable from `main` is pushed. `CHANGELOG.md` has one section
